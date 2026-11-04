@@ -28,6 +28,12 @@ judged by how far they close the 98.6 k → 123 k gap and by per-user speed.
 `green-mf088`: 370,185 KV tokens (+7 %) and max running 55 change nothing (+0.2 %). Device KV
 capacity is no longer a limiter at c32.
 
+The cache is also at its ideal. Replaying the trace (`trace.v1.1-append-ideal-warm.jsonl`, 12,880
+rows) with an infinite append-only cache gives an 88.3 % prefix hit (character level, longest
+common prefix with the previous request of the same room). The measured 91.8 % token hit is
+already above that, because warm-ups pre-fill each room's first turn. What is left is prefill of
+genuinely new tokens plus decode, so only scheduling and kernel speed remain as levers.
+
 Kernel dispatch in the C config (server.log): attention verify (q ≤ 10) runs Green, while
 prefill-shaped verify (q = 12, 16) falls back. GDN verify falls back because the bf16 SSM state
 is outside the V4 kernel's fp32 regime.
