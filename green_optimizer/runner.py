@@ -69,6 +69,8 @@ def build_launch(cfg: Dict[str, Any], tpl: Dict[str, Any], fixed: Optional[Dict[
         env[SRPT_ENV] = "1"
         if env.get("SGLANG_PLUGINS"):  # a whitelist must let the plugin load
             env["SGLANG_PLUGINS"] += ",green_optimizer"
+    if values.get("prefill_delayer_queue_min_ratio") is not None:
+        flags["--enable-prefill-delayer"] = True  # the queue-ratio trigger is read only with the delayer on
     flags["--port"] = port
     argv = [tpl["python"], "-m", "sglang.launch_server", *_flag_args(flags)]
     return argv, env

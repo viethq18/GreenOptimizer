@@ -23,6 +23,7 @@ from .objective import OBJECTIVES, Shape, auto_objective, rank_key
 from .roofline import CalibParams, Prediction, predict
 from .spec import (
     ONLINE_KNOBS,
+    OPT_IN_SPACE,
     SLO,
     Hardware,
     ModelSpec,
@@ -32,9 +33,16 @@ from .spec import (
 )
 
 # knobs the roofline does not model: their effect is decided by measurement only
-UNMODELLED = ("max_prefill_tokens", "schedule_policy")
-# default for each unmodelled knob while ranking (the production launch.sh values)
-UNMODELLED_DEFAULTS = {"max_prefill_tokens": 16384, "schedule_policy": "dfs-weight"}
+UNMODELLED = ("max_prefill_tokens", "schedule_policy", *OPT_IN_SPACE)
+# default for each unmodelled knob while ranking (the production launch.sh values; sglang's for opt-in knobs)
+UNMODELLED_DEFAULTS = {"max_prefill_tokens": 16384, "schedule_policy": "dfs-weight", **{k: v[0] for k, v in OPT_IN_SPACE.items()}}
+
+
+def unmodelled_defaults(space: SearchSpace) -> Dict[str, Any]:
+    """``UNMODELLED_DEFAULTS`` restricted to the knobs ``space`` puts in its configs."""
+    return {k: v for k, v in UNMODELLED_DEFAULTS.items() if k not in OPT_IN_SPACE or k in space.space}
+
+
 SLACK = 0.20
 ROUND1_K = 24
 ROUND1_REQUESTS = 200
@@ -87,8 +95,9 @@ def prefilter(
     """
     seen = set()
     out: List[Candidate] = []
+    defaults = unmodelled_defaults(space)
     for cfg in space.configs():
-        cfg = {**cfg, **UNMODELLED_DEFAULTS}
+        cfg = {**cfg, **defaults}
         if config_key(cfg) in seen:
             continue
         seen.add(config_key(cfg))

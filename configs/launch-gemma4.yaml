@@ -28,6 +28,9 @@ knob_flags:
   swa_full_tokens_ratio: --swa-full-tokens-ratio
   schedule_policy: --schedule-policy
   mem_fraction_static: --mem-fraction-static
+  enable_mixed_chunk: --enable-mixed-chunk
+  prefill_decode_interval: --prefill-decode-interval
+  prefill_delayer_queue_min_ratio: --prefill-delayer-queue-min-ratio
 hicache_args:
   --enable-hierarchical-cache: true
   --hicache-size: 64

@@ -103,6 +103,18 @@ def test_prefilter_example_slo_is_infeasible_on_livekit():
     assert S.passing(cands) == []  # TTFT p90 < 500 ms at ISL 21k is not reachable
 
 
+def test_opt_in_knobs_absent_by_default_swept_when_listed():
+    assert not set(S.OPT_IN_SPACE) & set(next(SearchSpace().for_model(QWEN).configs()))
+    sp = SearchSpace(space={**_small_space().space, "enable_mixed_chunk": [False, True], "prefill_decode_interval": [None, 8]}).for_model(QWEN)
+    cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)
+    assert len(cands) == sp.size() // 16  # ranked at sglang's defaults: the roofline does not model them
+    best = cands[0].cfg
+    assert best["enable_mixed_chunk"] is False and best["prefill_decode_interval"] is None
+    assert "prefill_delayer_queue_min_ratio" not in best  # unlisted opt-in knob stays absent
+    swept = {(k, v[k]) for v in S.unmodelled_variants(best, sp) for k in S.OPT_IN_SPACE if k in best and v[k] != best[k]}
+    assert swept == {("enable_mixed_chunk", True), ("prefill_decode_interval", 8)}
+
+
 def test_successive_halving_with_fake_measure():
     sp = _small_space()
     cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)

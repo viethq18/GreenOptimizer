@@ -246,6 +246,18 @@ DEFAULT_SPACE: Dict[str, List[Any]] = {
     "hicache": [True, False],
 }
 
+# Opt-in knobs: searched only when listed in a --space yaml; otherwise absent from every config,
+# so no flag reaches the server and the default search is unchanged. First value = sglang's default.
+OPT_IN_SPACE: Dict[str, List[Any]] = {
+    # --enable-mixed-chunk: decode requests ride along in prefill-chunk batches
+    "enable_mixed_chunk": [False, True],
+    # --prefill-decode-interval: decode rounds after a prefill batch before the next one
+    # (None = flag not passed, sglang's per-model default)
+    "prefill_decode_interval": [None, 4, 8, 16],
+    # --enable-prefill-delayer with --prefill-delayer-queue-min-ratio (None = delayer off)
+    "prefill_delayer_queue_min_ratio": [None, 0.1, 0.3, 0.5],
+}
+
 # sglang's value when --swa-full-tokens-ratio is not given (server_args.py)
 SWA_FULL_TOKENS_RATIO_DEFAULT = 0.8
 
@@ -274,7 +286,7 @@ class SearchSpace(_Strict):
 
     @model_validator(mode="after")
     def _known(self) -> "SearchSpace":
-        unknown = (set(self.space) | set(self.excluded)) - set(DEFAULT_SPACE)
+        unknown = (set(self.space) | set(self.excluded)) - set(DEFAULT_SPACE) - set(OPT_IN_SPACE)
         if unknown:
             raise ValueError(f"unknown search-space knob(s): {sorted(unknown)}")
         for k, vals in self.space.items():
@@ -298,9 +310,9 @@ class SearchSpace(_Strict):
 
     def configs(self) -> Iterator[Dict[str, Any]]:
         """Every combination; unsearched knobs take the first DEFAULT_SPACE value, excluded
-        knobs are absent."""
-        keys = [k for k in DEFAULT_SPACE if k not in self.excluded]
-        pools = [self.space.get(k, DEFAULT_SPACE[k][:1]) for k in keys]
+        knobs and unlisted ``OPT_IN_SPACE`` knobs are absent."""
+        keys = [k for k in DEFAULT_SPACE if k not in self.excluded] + [k for k in OPT_IN_SPACE if k in self.space]
+        pools = [self.space[k] if k in self.space else DEFAULT_SPACE[k][:1] for k in keys]
         for combo in itertools.product(*pools):
             cfg = dict(zip(keys, combo))
             cfg.update(self.fixed)

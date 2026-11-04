@@ -62,6 +62,14 @@ def test_build_launch_green_srpt_maps_to_sglang_policy_and_loads_plugin():
     assert "GREEN_SRPT" not in env
 
 
+def test_build_launch_opt_in_scheduler_knobs():
+    argv, _ = build_launch({**CFG, "enable_mixed_chunk": False, "prefill_decode_interval": None, "prefill_delayer_queue_min_ratio": None}, tpl, FIXED)
+    assert not {"--enable-mixed-chunk", "--prefill-decode-interval", "--enable-prefill-delayer"} & set(argv)
+    argv, _ = build_launch({**CFG, "enable_mixed_chunk": True, "prefill_decode_interval": 8, "prefill_delayer_queue_min_ratio": 0.3}, tpl, FIXED)
+    assert "--enable-mixed-chunk" in argv and _flag(argv, "--prefill-decode-interval") == "8"
+    assert "--enable-prefill-delayer" in argv and _flag(argv, "--prefill-delayer-queue-min-ratio") == "0.3"
+
+
 def test_render_launch_script_is_valid_bash(tmp_path):
     import subprocess
 

@@ -18,6 +18,7 @@ from .roofline import SWA_EVICTION_INTERVAL, Calibration, CalibParams, resolve_c
 from .runner import Runner, load_launch_template, render_launch_script, served_model_name
 from .spec import (
     ONLINE_KNOBS,
+    OPT_IN_SPACE,
     SLO,
     DEFAULT_SPACE,
     Hardware,
@@ -137,8 +138,9 @@ def write_report(
             "`swa_full_tokens_ratio` enters only through the hybrid-SWA pool split; a running request is assumed to hold "
             f"min(ctx, window) + {SWA_EVICTION_INTERVAL} SWA tokens (sglang's lazy out-of-window eviction interval)"
         )
+    unmodelled = S.unmodelled_defaults(space)
     L.append(
-        f"`{', '.join(S.UNMODELLED)}` are ranked at the production defaults ({S.UNMODELLED_DEFAULTS}) and decided by measurement only "
+        f"`{', '.join(unmodelled)}` are ranked at the production defaults ({unmodelled}) and decided by measurement only "
         "(a one-at-a-time sweep around the round-2 winner). " + "".join(n + "; " for n in knob_notes) +
         "`attention_backend=green` uses the A2 acceptance target as its KV-read efficiency (assumption, replace with the measured value once A2 is benchmarked)."
         + (" The DFLASH acceptance for draft lengths other than the calibrated one comes from a geometric model, not a measurement." if "speculative_num_draft_tokens" not in space.excluded else "")
@@ -310,7 +312,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--hw", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--model", required=True, help="model yaml (configs/models/*.yaml)")
-    s.add_argument("--space", help="search-space yaml (default: the plan's knobs)")
+    s.add_argument(
+        "--space",
+        help="search-space yaml (default: the plan's knobs). Opt-in, measured in the knob sweep only when listed: "
+        "schedule_policy value green-srpt, " + ", ".join(f"{k} {v}" for k, v in OPT_IN_SPACE.items()),
+    )
     s.add_argument("--launch", help="launch template yaml (configs/launch.yaml); needed to measure and to write best_launch.sh")
     s.add_argument("--top-k", type=int, default=S.ROUND1_K, help="configs entering halving round 1")
     s.add_argument("--prefilter-only", action="store_true", help="rank with the roofline only; launch no server")
