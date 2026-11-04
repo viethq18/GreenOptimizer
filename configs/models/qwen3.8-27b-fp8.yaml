@@ -1,0 +1,20 @@
+# Qwen3.8-27B-FP8 hybrid (config.json of /network-volume/rnd-sglang/models/Qwen3.8-27B-FP8):
+# 16 full-attention layers + 48 GDN (linear attention) layers.
+name: Qwen3.8-27B-FP8
+served_name: Qwen/Qwen3.8-27B-FP8
+weight_bytes: 27.0e9          # FP8 weights read once per decode step
+weight_gib_resident: 28.39    # server_native.log "weights" (incl. scales/embeds)
+active_params: 27.0e9         # 2 FLOPs per param per token
+max_context: 256000
+attention:
+  - {name: full, layers: 16, q_heads: 24, kv_heads: 4, head_dim: 256}
+gdn:
+  layers: 48
+  # recurrent state, fp32: 141.5 MiB per slot (server_native.log: 21.94 GiB / 155 slots)
+  state_bytes_fp32: 148.4e6
+  # conv state + replayssm intermediate window per slot (0.43 + 0.29 GiB / 155 slots)
+  extra_bytes_per_slot: 4.9e6
+  slots_per_request: 3
+draft:                        # incoai/Qwen3.8-27B-DFlash2
+  weight_gib: 3.69
+  kv_bytes_per_token: 19.0e3  # bf16 K+V of the draft, per token

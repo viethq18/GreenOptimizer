@@ -1,3 +1,4 @@
+model: Qwen3.8-27B-FP8
 provenance: >
   Two 1200 s InferenceX/aiperf 0.13.0.dev livekit runs at concurrency 32 on the SHARED H100
   (another user's eval used ~41 GB and ~100% util during both), server = runs/fa4fp8/launch.sh

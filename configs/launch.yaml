@@ -35,6 +35,7 @@ knob_flags:
   max_running_requests: --max-running-requests
   mamba_ssm_dtype: --mamba-ssm-dtype
   mamba_full_memory_ratio: --mamba-full-memory-ratio
+  swa_full_tokens_ratio: --swa-full-tokens-ratio
   schedule_policy: --schedule-policy
   mem_fraction_static: --mem-fraction-static
 hicache_args:

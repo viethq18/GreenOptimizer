@@ -85,6 +85,27 @@ def test_policy_ignores_missing_metrics():
         assert p.step(None, None).action == "hold"
 
 
+def test_policy_drifts_home_after_clean_windows_one_rung_at_a_time():
+    p = LadderPolicy(4, start=0, slo=SLO_, home=3, recover=2)
+    assert p.step(100, 150).action == "hold"
+    d = p.step(100, 150)
+    assert (d.action, d.rung) == ("to_home", 1)
+    p.step(100, 150)
+    p.step(None, 150)  # a window without TTFT samples is not clean
+    assert p.step(100, 150).action == "hold"
+    assert p.step(100, 150).rung == 2
+    # a violation pushes away from home and restarts the count
+    p.step(900, 150)
+    assert p.step(900, 150).action == "to_ttft"
+
+
+def test_policy_without_slo_tracking_holds_under_violation():
+    p = LadderPolicy(3, start=2, slo=SLO_, home=2, track_slo=False)
+    for _ in range(5):
+        d = p.step(900, 150)
+        assert (d.action, d.rung, d.ttft_violated) == ("hold", 2, True)
+
+
 def test_apply_rung_raises_when_not_updated():
     r = Rung(0, {"chunked_prefill_size": 4096, "max_running_requests": 32})
     sent = {}
@@ -137,6 +158,48 @@ def test_controller_moves_after_two_violating_windows_and_logs():
     assert actions[:3] == ["hold", "hold", "to_ttft"] or "to_ttft" in actions
     assert posts[-1]["server_args"]["green_chunked_prefill_size"] == 2048
     assert any(e["event"] == "apply" and e["why"] == "to_ttft" for e in ctl.events)
+
+
+def _shape_metrics(n, ttft_mean_s, itl_mean_s, osl, queue):
+    """Cumulative text for n finished requests, all within the SLO_ thresholds."""
+    return _metrics(n, 0, 0) + (
+        f'sglang:time_to_first_token_seconds_sum{{is_streaming="true"}} {n * ttft_mean_s}\n'
+        f'sglang:time_to_first_token_seconds_count{{is_streaming="true"}} {n}\n'
+        f"sglang:inter_token_latency_seconds_sum {n * osl * itl_mean_s}\n"
+        f"sglang:inter_token_latency_seconds_count {n * osl}\n"
+        f"sglang:generation_tokens_total {n * osl}\n"
+        f"sglang:num_requests_total {n}\n"
+        f"sglang:num_queue_reqs {queue}\n"
+    )
+
+
+def test_controller_auto_switches_mode_and_walks_to_the_new_home():
+    ladder = [Rung(i, {"chunked_prefill_size": c, "max_running_requests": 32}) for i, c in enumerate((2048, 4096, 8192))]
+    homes = {"balanced": 2, "ttft": 0, "itl": 2, "goodput": 2, "throughput": 2}
+    now = [0.0]
+    posts = []
+    # idle server, first token (400 ms) dominates decode (10 tokens x 4 ms)
+    texts = iter([_shape_metrics(100 * k, 0.4, 0.004, 10, 0) for k in range(1, 9)])
+    ctl = Controller(
+        "http://h:1", ladder, SLO_, interval_s=5, window_s=60,
+        get=lambda url: next(texts), post=lambda u, p: posts.append(p) or {"updated": True},
+        clock=lambda: now[0], sleep=lambda s: None,
+        objective="auto", homes=homes, auto_start="balanced", mode_patience=2, recover=1,
+    )
+    ctl.start()
+    assert ctl.policy.rung == 2 and ctl.mode == "balanced"
+    for _ in range(6):
+        now[0] += 5
+        ctl.tick()
+    assert ctl.mode == "ttft"
+    assert [e["mode"] for e in ctl.events if e["event"] == "mode"] == ["ttft"]
+    assert [e["why"] for e in ctl.events if e["event"] == "apply"][1:] == ["to_home", "to_home"]
+    assert ctl.policy.rung == 0 and posts[-1]["server_args"]["green_chunked_prefill_size"] == 2048
+
+
+def test_controller_objective_needs_homes():
+    with pytest.raises(ValueError):
+        Controller("http://h:1", [Rung(0, {"chunked_prefill_size": 2048, "max_running_requests": 8})], SLO_, objective="ttft")
 
 
 def test_load_ladder_yaml(tmp_path):
