@@ -1,0 +1,8 @@
+# NVIDIA H100 SXM 80GB (sm_90a). Spec-sheet dense peaks (the 3958 fp8 figure includes sparsity).
+name: h100-sxm-80gb
+sm_count: 132
+hbm_gib: 79.65          # nvidia-smi / sglang "total" of the measured box
+hbm_bw_tbs: 3.35
+peak_fp8_tflops: 1979
+peak_bf16_tflops: 989
+calibration: calibration/h100-fa4-livekit.yaml

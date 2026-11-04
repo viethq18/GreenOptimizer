@@ -1,0 +1,84 @@
+provenance: >
+  Two 1200 s InferenceX/aiperf 0.13.0.dev livekit runs at concurrency 32 on the SHARED H100
+  (another user's eval used ~41 GB and ~100% util during both), server = runs/fa4fp8/launch.sh
+  (fa4, kv fp8_e4m3, chunked 8192, DFLASH 4 draft, replayssm, hicache 64). Raw data:
+  /network-volume/rnd-sglang/results/livekit-c32/aiperf_artifacts and
+  /network-volume/rnd-sglang/results/livekit-c32-native/aiperf_artifacts (profile_export*.json*),
+  server memory plan from runs/fa4fp8/server_native.log, server metrics from the aiperf server-metrics export.
+fitted_parameters: [eta_p, eta_d, kv_usable_fraction, mean_stall_fraction, slow_tail_prefill_fraction,
+  ttft_tail_factor, mamba_derate, reserved_gib, spec_accept_p]
+predicted_metrics: [req_s, ttft_mean_ms, ttft_p90_ms, running, tok_s_fast, tok_s_slow,
+  max_running_effective, kv_tokens]
+caveat: >
+  The two runs are the same server configuration on the same trace, so they are near-identical
+  samples (consistency check, NOT a true hold-out); parameters were tuned on livekit-c32-native
+  ("fitted") and the other run is checked without re-tuning. kv_read_efficiency.fa4 = 0.79 is the
+  measured fa4 decode bandwidth fraction from the plan; kv_read_efficiency.green = 0.85 is the A2
+  ACCEPTANCE TARGET, not a measurement. The model does not capture max_prefill_tokens,
+  schedule_policy or radix-cache eviction; kv_read_efficiency/verify_overhead_per_token cannot be
+  calibrated from a single configuration (D=4, fp8 only) and are assumptions.
+max_rel_error: 0.20
+params:
+  eta_p: 0.47
+  eta_d: 0.285
+  kv_read_efficiency: {fa4: 0.79, green: 0.85}
+  kv_usable_fraction: 0.6
+  mean_stall_fraction: 0.42
+  slow_tail_prefill_fraction: 0.72
+  ttft_tail_factor: 1.63
+  mamba_derate: 0.954
+  reserved_gib: 7.1
+  spec_accept_p: 0.66
+  verify_overhead_per_token: 0.03
+  calibrated_draft_tokens: 4
+runs:
+  - name: livekit-c32-native
+    role: fitted
+    config: &prod
+      attention_backend: fa4
+      kv_cache_dtype: fp8_e4m3
+      chunked_prefill_size: 8192
+      max_prefill_tokens: 16384
+      max_running_requests: 128
+      mamba_ssm_dtype: float32
+      mamba_full_memory_ratio: 5
+      speculative_num_draft_tokens: 4
+      schedule_policy: dfs-weight
+      hicache: true
+      mem_fraction_static: 0.85
+    workload:
+      name: livekit
+      dataset: livekit-111868-v1.1-warm
+      concurrency: 32
+      isl: {mu: 9.8388, sigma: 0.7283, min: 756, max: 39986}
+      osl: {mu: 2.0526, sigma: 1.8153, min: 1, max: 289}
+      prefix_hit_rate: 0.513
+      think_time_s: 5.56
+    observed:
+      req_s: 1.202
+      ttft_mean_ms: 18198.7
+      ttft_p90_ms: 68327
+      running: 3.32
+      tok_s_fast: 68.57
+      tok_s_slow: 5.574
+      max_running_effective: 51
+      kv_tokens: 117725
+  - name: livekit-c32
+    role: held_out
+    config: *prod
+    workload:
+      name: livekit
+      dataset: livekit-111868-v1.1-warm
+      concurrency: 32
+      isl: {mu: 9.8742, sigma: 0.7118, min: 755, max: 36893}
+      osl: {mu: 2.0339, sigma: 1.8203, min: 1, max: 287}
+      prefix_hit_rate: 0.523
+      think_time_s: 5.56   # not measured for this run; native value reused
+    observed:
+      req_s: 1.116
+      ttft_p90_ms: 69600
+      running: 3.42
+      tok_s_fast: 69.0
+      tok_s_slow: 5.02
+      max_running_effective: 51
+      kv_tokens: 117725

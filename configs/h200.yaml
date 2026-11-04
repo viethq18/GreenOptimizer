@@ -1,0 +1,10 @@
+# NVIDIA H200 SXM 141GB (sm_90a, same SM as H100: kernels shared, only memory differs).
+# Uses the H100 calibration: efficiencies are properties of the kernels, not of the HBM size.
+# NOT validated on an H200 (none available in Phase 1).
+name: h200-sxm-141gb
+sm_count: 132
+hbm_gib: 139.7
+hbm_bw_tbs: 4.8
+peak_fp8_tflops: 1979
+peak_bf16_tflops: 989
+calibration: calibration/h100-fa4-livekit.yaml

@@ -1,0 +1,52 @@
+# Launch template for runner.py, modelled on /network-volume/rnd-sglang/runs/fa4fp8/launch.sh.
+# `args` are constant flags; a search config adds/overrides the flags in `knob_flags`.
+# `spec_args` are appended only when speculative_num_draft_tokens != off.
+# `hicache_args` only when hicache == on.
+cwd: /
+python: /usr/bin/python
+env:
+  CUDA_HOME: /usr/local/cuda-13.0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK: "1"
+  PYTHONPATH: /network-volume/rnd-sglang/sglang/python
+  CUDA_VISIBLE_DEVICES: "0"
+port: 30000
+ready_timeout_s: 1800
+args:
+  --model-path: network-volume/rnd-sglang/models/Qwen3.8-27B-FP8
+  --served-model-name: Qwen/Qwen3.8-27B-FP8
+  --trust-remote-code: true
+  --tp-size: 1
+  --context-length: 256000
+  --schedule-conservativeness: 0.3
+  --mamba-radix-cache-strategy: extra_buffer_lazy
+  --enable-linear-replayssm-spec: true
+  --linear-replayssm-cache-len: 32
+  --reasoning-parser: qwen3
+  --tool-call-parser: qwen3_coder
+  --enable-metrics: true
+  --enable-cache-report: true
+  --host: 0.0.0.0
+knob_flags:
+  attention_backend: --attention-backend
+  kv_cache_dtype: --kv-cache-dtype
+  chunked_prefill_size: --chunked-prefill-size
+  max_prefill_tokens: --max-prefill-tokens
+  max_running_requests: --max-running-requests
+  mamba_ssm_dtype: --mamba-ssm-dtype
+  mamba_full_memory_ratio: --mamba-full-memory-ratio
+  schedule_policy: --schedule-policy
+  mem_fraction_static: --mem-fraction-static
+hicache_args:
+  --enable-hierarchical-cache: true
+  --hicache-size: 64
+spec_args:
+  --speculative-algorithm: DFLASH
+  --speculative-draft-model-path: incoai/Qwen3.8-27B-DFlash2
+spec_draft_flag: --speculative-num-draft-tokens
+# extra flag appended when attention_backend == green (production keeps the DFLASH draft on fa4)
+green_args:
+  --speculative-draft-attention-backend: fa4
+# env added when attention_backend == green
+green_env:
+  SGLANG_PLUGINS: green_attention

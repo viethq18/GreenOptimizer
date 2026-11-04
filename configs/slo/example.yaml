@@ -1,0 +1,4 @@
+# Sample SLO from the plan. user_tok_s_p90_min = per-user decode speed that 90% of requests
+# meet or beat (slow tail, aiperf p10 of output_token_throughput_per_user).
+ttft_p90_ms: 500
+user_tok_s_p90_min: 100

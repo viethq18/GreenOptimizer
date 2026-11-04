@@ -1,0 +1,17 @@
+# LiveKit agentic trace, closed loop. Statistics measured from
+# /network-volume/rnd-sglang/results/livekit-c32{,-native}/aiperf_artifacts/profile_export.jsonl
+# (n=1373 / 1476 requests, 1200 s profiling phase). ln-normal sigma is the record fit; mu is shifted
+# (+0.032 ISL, -0.175 OSL) so the CLIPPED mean equals the measured mean (ISL 21,362, OSL 28.6).
+name: livekit
+dataset: livekit-111868-v1.1-warm
+concurrency: 32
+isl: {mu: 9.8388, sigma: 0.7283, min: 756, max: 39986}   # mean 21,362 (trace) ; left skewed
+osl: {mu: 2.0526, sigma: 1.8153, min: 1, max: 289}       # mean 28.6, 38% of requests have 1 token (warm-ups)
+prefix_hit_rate: 0.513            # usage_prompt_cache_read_tokens / ISL, hicache on
+prefix_hit_rate_no_hicache: 0.316 # server cache-hit rate reported in the plan baseline for the radix cache alone
+think_time_s: 5.56                # mean (next request start - previous end) per lane, 1373 gaps; median 0.47 s
+bench:
+  scenario_yaml: benchmarks/single_node/serving/scenarios/livekit.yaml
+  dataset: livekit-111868-v1.1-warm
+  scenario_label: custom-agentic-livekit111868-v1.1-warm
+notes: ISL is left skewed (median 23.4k, p95 33.5k) so the ln-normal fit is approximate; roofline.py only uses it for prefill time quantiles.

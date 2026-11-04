@@ -1,0 +1,14 @@
+# InferenceX synthetic scenario: fixed ISL 2048, OSL 256 (ignore_eos), prefix-hit 0%, concurrency 8, no think time.
+name: synthetic-isl2k-osl256-c8
+dataset: main
+concurrency: 8
+isl: {mu: 7.624619, sigma: 0.0, min: 2048, max: 2048}
+osl: {mu: 5.545177, sigma: 0.0, min: 256, max: 256}
+prefix_hit_rate: 0.0
+think_time_s: 0.0
+bench:
+  scenario_yaml: benchmarks/single_node/serving/scenarios/synthetic.yaml
+  dataset: main
+  scenario_label: synthetic-isl2k-osl256
+  synthetic_isl: 2048
+  synthetic_osl: 256
