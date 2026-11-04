@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "green-optimizer"
+version = "0.1.0.dev0"
+description = "Offline config search and online SLO controller for SGLang servers"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+# SGLang, pydantic, pyyaml and requests come from SGLang's image
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["green_optimizer*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
