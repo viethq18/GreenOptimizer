@@ -266,6 +266,8 @@ SWA_FULL_TOKENS_RATIO_DEFAULT = 0.8
 
 # knobs that can change while the server runs (O2 ladder); everything else needs a restart
 ONLINE_KNOBS = ("chunked_prefill_size", "max_running_requests")
+# extra rung knobs of a green-srpt ladder (plugin keys green_srpt_age / green_srpt_min_share)
+SRPT_ONLINE_KNOBS = ("srpt_age", "srpt_min_share")
 
 
 def inapplicable_knobs(model: "ModelSpec") -> Dict[str, str]:

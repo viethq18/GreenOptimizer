@@ -29,6 +29,7 @@ so long prompts cannot starve.
   ``shortest_prefill_chunk_limit``), but it keeps ``min_share`` of the budget every round.
 * Online keys, only registered with ``GREEN_SRPT=1``: ``green_srpt_age`` (float in
   [0, 1]) and ``green_srpt_min_share`` (float in [0.05, 1]; 1 disables chunk sharing).
+  The sidecar sets them from the rungs of a green-srpt ladder (``search.with_srpt_rungs``).
 
 Decode-aware chunk cap (``GREEN_DECODE_CHUNK="b:c,b:c,..."``): every prefill round stalls
 the running decodes for one chunk, so with ``b`` or more requests running the chunk is
@@ -55,6 +56,8 @@ SRPT_BASE_POLICY = "shortest-prefill-first"  # the SGLang policy green-srpt exte
 AGE_KEY = "green_srpt_age"
 SHARE_KEY = "green_srpt_min_share"
 MIN_SHARE = 0.05
+DEFAULT_AGE = 0.25  # startup values; the sidecar's srpt rungs tighten from here
+DEFAULT_SHARE = 0.25
 
 DECODE_CHUNK_ENV = "GREEN_DECODE_CHUNK"
 
@@ -130,7 +133,7 @@ def srpt_enabled() -> bool:
 class SrptState:
     """green-srpt state. Process-wide: each scheduler (TP/DP rank) is its own process."""
 
-    def __init__(self, age: float = 0.25, min_share: float = 0.25):
+    def __init__(self, age: float = DEFAULT_AGE, min_share: float = DEFAULT_SHARE):
         self.age = age
         self.min_share = min_share
         self.processed = 0  # SGLang's prefill-token counter at the last calc_priority

@@ -21,6 +21,7 @@ from .spec import (
     ONLINE_KNOBS,
     OPT_IN_SPACE,
     SLO,
+    SRPT_ONLINE_KNOBS,
     DEFAULT_SPACE,
     Hardware,
     ModelSpec,
@@ -171,18 +172,22 @@ def write_report(
                      f"slow tok/s {wm.get('tok_s_slow', float('nan')):.1f}, total tok/s {wm.get('throughput_tok_s', float('nan')):,.0f}.\n")
     if ladder:
         L.append("## Online ladder (TTFT priority -> throughput priority)\n")
-        if homes:
-            home_of: Dict[int, List[str]] = {}
-            for o, i in homes.items():
-                home_of.setdefault(i, []).append(o)
-            L.append("| rung | chunked_prefill_size | max_running cap | TTFT p90 ms | slow tok/s | source | SLO | home of |")
-            L.append("|---|---|---|---|---|---|---|---|")
-        else:
-            L.append("| rung | chunked_prefill_size | max_running cap | TTFT p90 ms | slow tok/s | source | SLO |")
-            L.append("|---|---|---|---|---|---|---|")
+        srpt = SRPT_ONLINE_KNOBS[0] in ladder[0]["online"]
+        cols = ["rung", "chunked_prefill_size", "max_running cap", *(["srpt age / min_share"] if srpt else []), "TTFT p90 ms", "slow tok/s", "source", "SLO", *(["home of"] if homes else [])]
+        L.append("| " + " | ".join(cols) + " |")
+        L.append("|" + "---|" * len(cols))
+        home_of: Dict[int, List[str]] = {}
+        for o, i in (homes or {}).items():
+            home_of.setdefault(i, []).append(o)
         for r in ladder:
-            row = f"| {r['rung']} | {r['online']['chunked_prefill_size']} | {r['online']['max_running_requests']} | {r['ttft_p90_ms']:,.0f} | {r['tok_s_slow']:.1f} | {r['source']} | {'met' if r['slo_met'] else 'violated'} |"
-            L.append(row + (f" {', '.join(home_of.get(r['rung'], []))} |" if homes else ""))
+            on = r["online"]
+            cells = [r["rung"], on["chunked_prefill_size"], on["max_running_requests"]]
+            if srpt:
+                cells.append(f"{on[SRPT_ONLINE_KNOBS[0]]:g} / {on[SRPT_ONLINE_KNOBS[1]]:g}")
+            cells += [f"{r['ttft_p90_ms']:,.0f}", f"{r['tok_s_slow']:.1f}", r["source"], "met" if r["slo_met"] else "violated"]
+            if homes:
+                cells.append(", ".join(home_of.get(r["rung"], [])))
+            L.append("| " + " | ".join(str(c) for c in cells) + " |")
         L.append("")
     text = "\n".join(L) + "\n"
     (out / "report.md").write_text(text)

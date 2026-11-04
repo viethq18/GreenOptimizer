@@ -161,3 +161,18 @@ def test_ladder_is_sorted_and_varies_only_online_knobs():
         assert set(r["online"]) == {"chunked_prefill_size", "max_running_requests"}
         assert r["online"]["chunked_prefill_size"] <= base["chunked_prefill_size"]
         assert r["online"]["max_running_requests"] <= base["max_running_requests"]
+
+
+def test_srpt_base_ladder_tightens_srpt_below_rung_0_and_never_homes_there():
+    sp = _small_space()
+    base = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)[0].cfg
+    plain = S.build_ladder(base, wl, slo, hw, QWEN, calib.params, sp, {}, objective="balanced")
+    ladder = S.build_ladder({**base, "schedule_policy": "green-srpt"}, wl, slo, hw, QWEN, calib.params, sp, {}, objective="balanced")
+    n = len(ladder) - len(plain)
+    assert n == S.SRPT_TIGHTEN_STEPS and [r["rung"] for r in ladder] == list(range(len(ladder)))
+    levels = [(r["online"]["srpt_age"], r["online"]["srpt_min_share"]) for r in ladder]
+    assert levels[:n + 1] == S.srpt_levels()[::-1]  # tightest first, startup values from the first modelled rung on
+    assert set(levels[n:]) == {S.srpt_levels()[0]}
+    assert all(r["source"] == S.SRPT_SOURCE and r["online"]["chunked_prefill_size"] == plain[0]["online"]["chunked_prefill_size"] for r in ladder[:n])
+    assert [{k: r["online"][k] for k in ("chunked_prefill_size", "max_running_requests")} for r in ladder[n:]] == [r["online"] for r in plain]
+    assert {o: h - n for o, h in S.ladder_homes(ladder, slo).items()} == S.ladder_homes(plain, slo)

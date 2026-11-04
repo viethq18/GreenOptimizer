@@ -5,6 +5,9 @@ Pure-python (stdlib + pyyaml). Policy (plan O2), windows are ``window_s`` wide, 
   * TTFT p90 over SLO for 2 consecutive evaluations  -> one rung toward TTFT priority
   * slow-tail tok/s under SLO for 2 consecutive evals -> one rung toward throughput priority
   * both violated -> hold, log "infeasible at load"
+A green-srpt ladder also carries srpt age/min_share on every rung, with tightened srpt rungs
+below the modelled TTFT end (``search.with_srpt_rungs``): the same policy walks into them
+when the smallest chunk/cap still misses TTFT, and back out on tok/s violations or home.
 With an objective (ladder ``homes``), the controller starts on the objective's home rung and,
 after ``recover`` consecutive clean windows away from it, steps one rung back toward it;
 ``throughput`` ignores the SLO and holds its home. ``auto`` re-picks the objective from the
@@ -28,7 +31,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 import yaml
 
 from .objective import OBJECTIVES, Shape, auto_objective
-from .spec import SLO
+from .plugin import AGE_KEY, SHARE_KEY
+from .spec import SLO, SRPT_ONLINE_KNOBS
 
 log = logging.getLogger("green_optimizer.control")
 
@@ -138,7 +142,7 @@ def histogram_count(buckets: Buckets) -> float:
 @dataclass
 class Rung:
     rung: int
-    online: Dict[str, int]  # chunked_prefill_size / max_running_requests
+    online: Dict[str, float]  # chunked_prefill_size / max_running_requests (+ SRPT_ONLINE_KNOBS)
     ttft_p90_ms: float = 0.0
     tok_s_slow: float = 0.0
     source: str = ""
@@ -163,12 +167,16 @@ def load_ladder(path: str) -> List[Rung]:
     return rungs
 
 
-def server_args_for(rung: Rung) -> Dict[str, int]:
+def server_args_for(rung: Rung) -> Dict[str, float]:
     """The /set_internal_state payload keys (plugin handlers, see plugin.py)."""
-    return {
+    args: Dict[str, float] = {
         "green_chunked_prefill_size": int(rung.online["chunked_prefill_size"]),
         "green_max_running_cap": int(rung.online["max_running_requests"]),
     }
+    for k, key in zip(SRPT_ONLINE_KNOBS, (AGE_KEY, SHARE_KEY)):
+        if k in rung.online:
+            args[key] = float(rung.online[k])
+    return args
 
 
 # --------------------------------------------------------------------------- policy

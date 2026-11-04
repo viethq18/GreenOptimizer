@@ -20,11 +20,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .objective import OBJECTIVES, Shape, auto_objective, rank_key
+from .plugin import DEFAULT_AGE, DEFAULT_SHARE, MIN_SHARE, SRPT_POLICY
 from .roofline import CalibParams, Prediction, predict
 from .spec import (
     ONLINE_KNOBS,
     OPT_IN_SPACE,
     SLO,
+    SRPT_ONLINE_KNOBS,
     Hardware,
     ModelSpec,
     SearchSpace,
@@ -259,6 +261,8 @@ def build_ladder(
     Rungs are drawn from the SLO-meeting variants when there are any, except for the
     ``throughput`` objective, which ignores the SLO. With an ``objective`` the rungs also
     carry ``goodput_req_s`` (for ``ladder_homes``); without one the ladder is the original.
+    A green-srpt ``base`` also gets srpt knobs on every rung and ``with_srpt_rungs`` below
+    rung 0; any other base gets the original ladder.
     """
     measured = measured or {}
     rows: List[Dict[str, Any]] = []
@@ -281,10 +285,38 @@ def build_ladder(
     ladder = pareto_front(pool, minimise="ttft_p90_ms", maximise="tok_s_slow")
     # ties on the front's metrics: the rung that keeps the larger chunk/cap is more throughput-oriented
     ladder.sort(key=lambda r: (r["ttft_p90_ms"], -r["tok_s_slow"]))
+    if base.get("schedule_policy") == SRPT_POLICY:
+        ladder = with_srpt_rungs(ladder)
     for i, r in enumerate(ladder):
         r["rung"] = i
         r["slo_met"] = r["violation"] <= 0
     return ladder
+
+
+SRPT_SOURCE = "srpt"  # ladder rungs past the modelled TTFT end (green-srpt is unmodelled)
+SRPT_TIGHTEN_STEPS = 2
+
+
+def srpt_levels(steps: int = SRPT_TIGHTEN_STEPS) -> List[Tuple[float, float]]:
+    """green-srpt ``(age, min_share)`` from the plugin's startup values (index 0), halving
+    both per step. A smaller ``min_share`` hands more of a long prompt's chunk to the short
+    prompts queued behind it; a smaller ``age`` keeps short prompts ahead for longer. Both
+    favour the short majority (TTFT p90) over the longest prompts, whose worst-case wait
+    (``(w - s) / age`` prefill tokens, plugin.py) doubles per step: bounded, never age 0."""
+    return [(DEFAULT_AGE / 2**i, max(MIN_SHARE, DEFAULT_SHARE / 2**i)) for i in range(steps + 1)]
+
+
+def with_srpt_rungs(ladder: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every rung keeps the startup srpt values; tightened srpt rungs on rung 0's chunk/cap
+    go below it, so the controller reaches for them only once the modelled ladder has no
+    more TTFT to give. Their metrics are rung 0's (source ``srpt``: not modelled)."""
+    if not ladder:
+        return ladder
+    (age0, share0), *tight = srpt_levels()
+    for r in ladder:
+        r["online"].update(zip(SRPT_ONLINE_KNOBS, (age0, share0)))
+    extra = [{**ladder[0], "online": {**ladder[0]["online"], **dict(zip(SRPT_ONLINE_KNOBS, lv))}, "source": SRPT_SOURCE} for lv in reversed(tight)]
+    return extra + ladder
 
 
 def ladder_homes(ladder: Sequence[Dict[str, Any]], slo: SLO) -> Dict[str, int]:
@@ -292,4 +324,6 @@ def ladder_homes(ladder: Sequence[Dict[str, Any]], slo: SLO) -> Dict[str, int]:
     controller starts and where it drifts back to while the SLO holds."""
     if not ladder:
         return {}
-    return {o: min(ladder, key=lambda r: (rank_key(o, slo, {**r, "ok": True}), r["rung"]))["rung"] for o in OBJECTIVES}
+    # srpt rungs are a TTFT escape hatch, not a place to stay: their metrics are copies
+    modelled = [r for r in ladder if r.get("source") != SRPT_SOURCE]
+    return {o: min(modelled, key=lambda r: (rank_key(o, slo, {**r, "ok": True}), r["rung"]))["rung"] for o in OBJECTIVES}
