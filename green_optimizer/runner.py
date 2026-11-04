@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
-from .plugin import SRPT_BASE_POLICY, SRPT_ENV, SRPT_POLICY
+from .plugin import DECODE_CHUNK_ENV, SRPT_BASE_POLICY, SRPT_ENV, SRPT_POLICY
 from .spec import SLO, SPEC_OFF, Workload
 
 log = logging.getLogger("green_optimizer.runner")
@@ -67,8 +67,13 @@ def build_launch(cfg: Dict[str, Any], tpl: Dict[str, Any], fixed: Optional[Dict[
         # green-srpt = SGLang's shortest-prefill-first + this package's plugin hooks
         flags[tpl["knob_flags"]["schedule_policy"]] = SRPT_BASE_POLICY
         env[SRPT_ENV] = "1"
-        if env.get("SGLANG_PLUGINS"):  # a whitelist must let the plugin load
-            env["SGLANG_PLUGINS"] += ",green_optimizer"
+    if values.get("decode_chunk_cap"):
+        if "decode_chunk_table" not in values:
+            raise ValueError("decode_chunk_cap needs decode_chunk_table (roofline.decode_chunk_table of the config)")
+        if values["decode_chunk_table"]:  # "" = the roofline needs no cap for this config
+            env[DECODE_CHUNK_ENV] = values["decode_chunk_table"]
+    if (SRPT_ENV in env or DECODE_CHUNK_ENV in env) and env.get("SGLANG_PLUGINS"):
+        env["SGLANG_PLUGINS"] += ",green_optimizer"  # a whitelist must let the plugin load
     if values.get("prefill_delayer_queue_min_ratio") is not None:
         flags["--enable-prefill-delayer"] = True  # the queue-ratio trigger is read only with the delayer on
     flags["--port"] = port

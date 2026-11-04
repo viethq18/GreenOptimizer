@@ -4,9 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from green_optimizer.plugin import decode_chunk_cap, format_chunk_table, parse_chunk_table
 from green_optimizer.roofline import (
+    CHUNK_GRANULE,
     accept_length,
     attended_keys,
+    decode_chunk_table,
     memory_plan,
     predict,
     prefill_time,
@@ -145,3 +148,22 @@ def test_gemma_swa_pool_below_window_is_infeasible_and_small_pool_caps_running()
     assert small.feasible and small.running <= 0.6 * small.swa_tokens / swa_per_req
     balanced = predict({**GEMMA_CFG, "swa_full_tokens_ratio": 0.05, "max_running_requests": 128}, wl, hw, gemma, calib.params)
     assert balanced.running > small.running
+
+
+def test_decode_chunk_table_is_a_valid_plugin_table_tightening_with_the_slo():
+    wl = load_workload(str(ROOT / "configs" / "workloads" / "livekit.yaml"))
+    cfg = calib.runs[0].config
+
+    def table(tok_s):
+        rows = decode_chunk_table(cfg, wl, hw, model, calib.params, SLO(ttft_p90_ms=2000, user_tok_s_p90_min=tok_s))
+        assert parse_chunk_table(format_chunk_table(rows)) == tuple(rows)  # the plugin accepts it
+        assert all(c % CHUNK_GRANULE == 0 and c < cfg["chunked_prefill_size"] for _, c in rows)
+        return rows
+
+    assert table(1.0) == []  # every chunk already meets a lax SLO
+    assert table(100.0) == []  # decode alone misses it: no chunk can help, none is sacrificed
+    loose, strict = table(10.0), table(12.0)
+    assert len(loose) >= 2  # the cap falls as the running batch grows
+    for b in range(1, 21):  # decode alone meets both SLOs here
+        lc, sc = decode_chunk_cap(tuple(loose), b), decode_chunk_cap(tuple(strict), b)
+        assert sc is not None and (lc is None or sc <= lc)

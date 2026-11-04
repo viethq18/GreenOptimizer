@@ -247,7 +247,8 @@ DEFAULT_SPACE: Dict[str, List[Any]] = {
 }
 
 # Opt-in knobs: searched only when listed in a --space yaml; otherwise absent from every config,
-# so no flag reaches the server and the default search is unchanged. First value = sglang's default.
+# so no flag reaches the server and the default search is unchanged. First value = the default
+# behaviour (sglang's, or no plugin feature).
 OPT_IN_SPACE: Dict[str, List[Any]] = {
     # --enable-mixed-chunk: decode requests ride along in prefill-chunk batches
     "enable_mixed_chunk": [False, True],
@@ -256,6 +257,8 @@ OPT_IN_SPACE: Dict[str, List[Any]] = {
     "prefill_decode_interval": [None, 4, 8, 16],
     # --enable-prefill-delayer with --prefill-delayer-queue-min-ratio (None = delayer off)
     "prefill_delayer_queue_min_ratio": [None, 0.1, 0.3, 0.5],
+    # GreenOptimizer plugin: per-running-batch chunk cap from roofline.decode_chunk_table
+    "decode_chunk_cap": [False, True],
 }
 
 # sglang's value when --swa-full-tokens-ratio is not given (server_args.py)

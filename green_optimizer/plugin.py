@@ -29,13 +29,19 @@ so long prompts cannot starve.
   ``shortest_prefill_chunk_limit``), but it keeps ``min_share`` of the budget every round.
 * Online keys, only registered with ``GREEN_SRPT=1``: ``green_srpt_age`` (float in
   [0, 1]) and ``green_srpt_min_share`` (float in [0.05, 1]; 1 disables chunk sharing).
+
+Decode-aware chunk cap (``GREEN_DECODE_CHUNK="b:c,b:c,..."``): every prefill round stalls
+the running decodes for one chunk, so with ``b`` or more requests running the chunk is
+capped at ``c`` (the live ``chunked_prefill_size`` still bounds it; ``truncation_align_size``
+floors it). The same ``get_new_batch_prefill`` AROUND hook applies it for the call only.
+GreenOptimizer derives the table from the roofline (``roofline.decode_chunk_table``).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,8 @@ SRPT_BASE_POLICY = "shortest-prefill-first"  # the SGLang policy green-srpt exte
 AGE_KEY = "green_srpt_age"
 SHARE_KEY = "green_srpt_min_share"
 MIN_SHARE = 0.05
+
+DECODE_CHUNK_ENV = "GREEN_DECODE_CHUNK"
 
 _POLICY = "sglang.srt.managers.schedule_policy.SchedulePolicy"
 PRIORITY_TARGET = _POLICY + ".calc_priority"
@@ -73,8 +81,10 @@ SGLANG_READS = {
     ),
     "srt/managers/scheduler.py": (
         "get_new_batch_prefill",
+        "get_new_batch_prefill(running_batch)",
         "chunked_prefill_size",
         "max_running_requests",
+        "truncation_align_size",
         "arrival_processed_tokens",
     ),
     "srt/managers/schedule_policy.py": (
@@ -86,6 +96,7 @@ SGLANG_READS = {
         '"shortest-prefill-first"',
     ),
     "srt/managers/schedule_batch.py": (
+        "reqs",
         "rid",
         "origin_input_ids",
         "output_ids",
@@ -127,6 +138,41 @@ class SrptState:
 
 
 SRPT = SrptState()
+
+
+ChunkTable = Tuple[Tuple[int, int], ...]
+
+
+def parse_chunk_table(text: str) -> ChunkTable:
+    """``"b:c,b:c"`` -> ((b, c), ...). Running counts strictly increase from >= 1, caps
+    strictly decrease and stay >= MIN_CHUNK. Empty text is no table."""
+    rows = []
+    for item in filter(None, (s.strip() for s in text.split(","))):
+        b, sep, c = item.partition(":")
+        if not sep:
+            raise ValueError(f"{DECODE_CHUNK_ENV}: {item!r} is not running:chunk")
+        rows.append((int(b), int(c)))
+    ordered = all(b1 > b0 and c1 < c0 for (b0, c0), (b1, c1) in zip(rows, rows[1:]))
+    if not ordered or (rows and (rows[0][0] < 1 or rows[-1][1] < MIN_CHUNK)):
+        raise ValueError(f"{DECODE_CHUNK_ENV}={text!r}: running counts must rise from >= 1, caps fall and stay >= {MIN_CHUNK}")
+    return tuple(rows)
+
+
+def format_chunk_table(rows: Iterable[Tuple[int, int]]) -> str:
+    return ",".join(f"{b}:{c}" for b, c in rows)
+
+
+def decode_chunk_cap(rows: ChunkTable, running: int) -> Optional[int]:
+    """The cap of the last row whose running count ``running`` reaches, else None."""
+    cap = None
+    for b, c in rows:
+        if running < b:
+            break
+        cap = c
+    return cap
+
+
+DECODE_CHUNK: ChunkTable = ()  # set by register() from GREEN_DECODE_CHUNK
 
 
 def _ceil_pages(n: int, page_size: int) -> int:
@@ -277,16 +323,30 @@ class OnlineKnobs:
 
 
 def admit_around(original_fn, self, *args, **kwargs):
-    """AROUND hook for Scheduler.get_new_batch_prefill: enforce the admission cap."""
+    """AROUND hook for Scheduler.get_new_batch_prefill(running_batch): lower the admission
+    cap and the decode-aware chunk cap for the duration of the call, restored in ``finally``."""
+    lowered: Dict[str, int] = {}
     cap = getattr(self, "_green_max_running_cap", None)
-    if cap is None or cap >= self.max_running_requests:
+    if cap is not None and cap < self.max_running_requests:
+        lowered["max_running_requests"] = cap
+    chunk = self.chunked_prefill_size
+    if DECODE_CHUNK and chunk is not None:
+        running = args[0] if args else kwargs["running_batch"]
+        limit = decode_chunk_cap(DECODE_CHUNK, len(running.reqs))
+        if limit is not None:
+            limit = max(limit, getattr(self, "truncation_align_size", None) or 0)
+            if limit < chunk:
+                lowered["chunked_prefill_size"] = limit
+    if not lowered:
         return original_fn(self, *args, **kwargs)
-    full = self.max_running_requests
-    self.max_running_requests = cap
+    saved = {k: getattr(self, k) for k in lowered}
     try:
+        for k, v in lowered.items():
+            setattr(self, k, v)
         return original_fn(self, *args, **kwargs)
     finally:
-        self.max_running_requests = full
+        for k, v in saved.items():
+            setattr(self, k, v)
 
 
 def add_handlers(result: Dict[str, Any], controller) -> Dict[str, Any]:
@@ -309,10 +369,14 @@ def add_handlers(result: Dict[str, Any], controller) -> Dict[str, Any]:
 
 def register() -> None:
     """SGLang's plugin loader calls this in every process, before any model is built."""
+    global DECODE_CHUNK
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+    DECODE_CHUNK = parse_chunk_table(os.environ.get(DECODE_CHUNK_ENV, ""))
     HookRegistry.register(HANDLERS_TARGET, add_handlers, HookType.AFTER)
     HookRegistry.register(ADMIT_TARGET, admit_around, HookType.AROUND)
+    if DECODE_CHUNK:
+        logger.info("green_optimizer: decode-aware chunk cap %s", format_chunk_table(DECODE_CHUNK))
     if srpt_enabled():
         HookRegistry.register(PRIORITY_TARGET, priority_around, HookType.AROUND)
         HookRegistry.register(SORT_TARGET, sort_around, HookType.AROUND)

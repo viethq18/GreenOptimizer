@@ -70,6 +70,19 @@ def test_build_launch_opt_in_scheduler_knobs():
     assert "--enable-prefill-delayer" in argv and _flag(argv, "--prefill-delayer-queue-min-ratio") == "0.3"
 
 
+def test_build_launch_decode_chunk_cap_sets_plugin_env_once():
+    _, env = build_launch({**CFG, "decode_chunk_cap": False}, tpl, FIXED)
+    assert "GREEN_DECODE_CHUNK" not in env
+    with pytest.raises(ValueError):
+        build_launch({**CFG, "decode_chunk_cap": True}, tpl, FIXED)  # table not resolved
+    _, env = build_launch({**CFG, "decode_chunk_cap": True, "decode_chunk_table": ""}, tpl, FIXED)
+    assert "GREEN_DECODE_CHUNK" not in env  # empty table: nothing to cap
+    cfg = {**CFG, "decode_chunk_cap": True, "decode_chunk_table": "8:4096,32:2048", "attention_backend": "green", "schedule_policy": "green-srpt"}
+    _, env = build_launch(cfg, tpl, FIXED)
+    assert env["GREEN_DECODE_CHUNK"] == "8:4096,32:2048"
+    assert env["SGLANG_PLUGINS"] == "green_attention,green_optimizer"
+
+
 def test_render_launch_script_is_valid_bash(tmp_path):
     import subprocess
 

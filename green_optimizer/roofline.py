@@ -27,6 +27,8 @@ queue     one prefill server (M/G/1, Pollaczek-Khinchine wait) fed by a closed l
 tok/s     fast tail = accept/step, slow tail (10th percentile, the SLO side) =
           accept/(step + phi*rho*chunk_time) because decode batches are interleaved with
           prefill chunks of ``chunked_prefill_size`` tokens.
+chunk cap the decode-aware cap at running batch B is the largest chunk C with
+          accept/(step(B) + phi*t(C)) >= the SLO speed (rho = 1); ``decode_chunk_table``.
 unsupported  configs listed in the model's ``unsupported`` block are infeasible with its reason.
 """
 
@@ -34,7 +36,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +50,7 @@ from .spec import (
     ModelSpec,
     Workload,
 )
+from .plugin import MIN_CHUNK
 
 GIB = 2**30
 QUANTILES = 512
@@ -55,6 +58,8 @@ QUANTILES = 512
 SWA_EVICTION_INTERVAL = 128
 # sglang --page-size of the measured launches (fa4_try1.log server_args)
 PAGE_SIZE = 1
+# decode_chunk_table rounds its caps down to this many tokens
+CHUNK_GRANULE = 256
 
 
 class CalibParams(BaseModel):
@@ -379,6 +384,47 @@ def predict(cfg: Dict[str, Any], wl: Workload, hw: Hardware, model: ModelSpec, p
         slo_attainment=att,
         goodput_req_s=None if att is None else lam * att,
     )
+
+
+def decode_chunk_table(cfg: Dict[str, Any], wl: Workload, hw: Hardware, model: ModelSpec, p: CalibParams, slo: SLO) -> List[Tuple[int, int]]:
+    """Rows (B, C) of the plugin's ``GREEN_DECODE_CHUNK``: from B running requests on the chunk
+    is capped at C, the largest multiple of CHUNK_GRANULE in [MIN_CHUNK, chunked_prefill_size)
+    whose stall keeps ``predict``'s slow-tail per-user speed at the SLO with the prefill server
+    busy (rho = 1): accept / (step(B) + phi * t(C)) >= user_tok_s_p90_min. Where even MIN_CHUNK
+    misses it the cap is MIN_CHUNK. From the B where decode alone misses the SLO no chunk can
+    rescue it, so the table stops (the last cap holds; [] if that is already B = 1).
+    Only rows where the cap falls; [] when none is needed."""
+    top = int(cfg["chunked_prefill_size"])
+    phi = p.slow_tail_prefill_fraction
+    if top <= MIN_CHUNK or phi <= 0:
+        return []
+    dist = _Dist(wl, wl.hit_rate(bool(cfg["hicache"])))
+    ctx = dist.isl_mean + dist.osl_mean / 2.0
+    acc = accept_length(cfg, p)
+    calib_f = _chunk_factor(p.calibrated_chunk_size, p)
+
+    def chunk_t(c: int) -> float:  # predict's chunk_t at chunk size c
+        return prefill_time(c, ctx, hw, model, p.eta_p * _chunk_factor(c, p) / calib_f)
+
+    lo_k, hi_k = -(-MIN_CHUNK // CHUNK_GRANULE), (top - 1) // CHUNK_GRANULE  # cap candidates k * granule
+    rows: List[Tuple[int, int]] = []
+    for b in range(1, int(cfg["max_running_requests"]) + 1):
+        stall = (acc / slo.user_tok_s_p90_min - _decode_step(b, ctx, cfg, hw, model, p)) / phi
+        if stall <= 0:
+            break  # step(B) grows with B: decode alone misses the SLO from here on
+        if chunk_t(top) <= stall:
+            continue
+        lo, hi = lo_k, hi_k  # largest k with chunk_t(k * granule) <= stall, else lo_k
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if chunk_t(mid * CHUNK_GRANULE) <= stall:
+                lo = mid
+            else:
+                hi = mid - 1
+        cap = lo * CHUNK_GRANULE
+        if not rows or cap < rows[-1][1]:
+            rows.append((b, cap))
+    return rows
 
 
 def ttft_lower_bound(wl: Workload, hw: Hardware, model: ModelSpec, p: Optional[CalibParams], hit: float = 0.0) -> Dict[str, float]:

@@ -77,6 +77,61 @@ def test_admit_around_restores_on_error_and_passes_through_without_cap():
     assert seen == [51]
 
 
+def test_parse_chunk_table_round_trips_and_rejects_bad_tables():
+    rows = plugin.parse_chunk_table(" 8:4096, 32:2048 ")
+    assert rows == ((8, 4096), (32, 2048))
+    assert plugin.parse_chunk_table(plugin.format_chunk_table(rows)) == rows
+    assert plugin.parse_chunk_table("") == ()
+    for bad in ("8:4096,8:2048", "32:2048,8:4096", "8:2048,32:4096", "0:4096", "8:512", "8", "a:b"):
+        with pytest.raises(ValueError):
+            plugin.parse_chunk_table(bad)
+
+
+def test_decode_chunk_cap_takes_the_last_row_reached():
+    rows = ((8, 4096), (32, 2048))
+    assert [plugin.decode_chunk_cap(rows, b) for b in (0, 7, 8, 31, 32, 99)] == [None, None, 4096, 4096, 2048, 2048]
+
+
+class Batch:
+    def __init__(self, n):
+        self.reqs = [object()] * n
+
+
+def test_admit_around_caps_chunk_by_running_batch_and_restores(monkeypatch):
+    monkeypatch.setattr(plugin, "DECODE_CHUNK", ((8, 4096), (32, 2048)))
+    s = Sched()
+    s._green_max_running_cap = 16
+    seen = []
+
+    def orig(self, running_batch):
+        seen.append((self.chunked_prefill_size, self.max_running_requests))
+        if len(running_batch.reqs) == 40:
+            raise RuntimeError("x")
+        return "batch"
+
+    assert plugin.admit_around(orig, s, Batch(4)) == "batch"
+    assert plugin.admit_around(orig, s, running_batch=Batch(10)) == "batch"
+    with pytest.raises(RuntimeError):
+        plugin.admit_around(orig, s, Batch(40))
+    assert seen == [(8192, 16), (4096, 16), (2048, 16)]
+    assert (s.chunked_prefill_size, s.max_running_requests) == (8192, 51)
+    s.chunked_prefill_size = 3000  # an online chunk below the table cap wins
+    plugin.admit_around(orig, s, Batch(10))
+    assert seen[-1][0] == 3000 and s.chunked_prefill_size == 3000
+
+
+def test_admit_around_chunk_cap_respects_truncation_align_and_disabled_chunking(monkeypatch):
+    monkeypatch.setattr(plugin, "DECODE_CHUNK", ((1, 2048),))
+    s = Sched()
+    s.truncation_align_size = 3072
+    seen = []
+    plugin.admit_around(lambda self, b: seen.append(self.chunked_prefill_size), s, Batch(4))
+    s2 = Sched(chunk=None)
+    plugin.admit_around(lambda self, b: seen.append(self.chunked_prefill_size), s2, Batch(4))
+    assert seen == [3072, None] and s.chunked_prefill_size == 8192
+
+
+
 class Req:
     """The Req fields green-srpt reads: uncached work = input - matched prefix."""
 
