@@ -36,6 +36,8 @@ from .spec import (
 )
 
 log = logging.getLogger("green_optimizer")
+# `search` without --model keeps its pre-multi-model meaning (the Qwen spec was built in).
+DEFAULT_MODEL = Path(__file__).resolve().parent.parent / "configs" / "models" / "qwen3.8-27b-fp8.yaml"
 
 _SHOWN_KNOBS = ("attention_backend", "kv_cache_dtype", "chunked_prefill_size", "max_running_requests", "mamba_ssm_dtype", "mamba_full_memory_ratio", "swa_full_tokens_ratio", "speculative_num_draft_tokens", "hicache")
 
@@ -324,7 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--slo", required=True)
     s.add_argument("--hw", required=True)
     s.add_argument("--out", required=True)
-    s.add_argument("--model", required=True, help="model yaml (configs/models/*.yaml)")
+    s.add_argument("--model", default=str(DEFAULT_MODEL), help="model yaml (configs/models/*.yaml; default: %(default)s)")
     s.add_argument(
         "--space",
         help="search-space yaml (default: the plan's knobs). Opt-in, measured in the knob sweep only when listed: "
