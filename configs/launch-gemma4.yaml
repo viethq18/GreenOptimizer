@@ -38,3 +38,7 @@ spec_args: {}
 # env added when attention_backend == green
 green_env:
   SGLANG_PLUGINS: green_attention
+  # fork route: E4M3 prefill with head_dim <= 256 (the 50 sliding layers) on FA3's FP8 kernel instead
+  # of FA4's; the HD512 global layers stay on green. H100 microbench: 1.07-1.38x per call for
+  # 2k-8k-token chunks, 3.4-4.2x for 64-512-token extends (GreenAttention docs/gemma4.md).
+  SGLANG_FA4_SM90_FP8_PREFILL_VIA_FA3: "1"
