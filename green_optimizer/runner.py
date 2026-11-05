@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
 
-from .spec import SPEC_OFF, Workload
+from .plugin import DECODE_CHUNK_ENV, SRPT_BASE_POLICY, SRPT_ENV, SRPT_POLICY
+from .spec import SLO, SPEC_OFF, Workload
 
 log = logging.getLogger("green_optimizer.runner")
 
@@ -62,6 +63,19 @@ def build_launch(cfg: Dict[str, Any], tpl: Dict[str, Any], fixed: Optional[Dict[
         if spec_on:
             flags.update(tpl.get("green_args", {}))
         env.update({k: str(v) for k, v in tpl.get("green_env", {}).items()})
+    if values.get("schedule_policy") == SRPT_POLICY:
+        # green-srpt = SGLang's shortest-prefill-first + this package's plugin hooks
+        flags[tpl["knob_flags"]["schedule_policy"]] = SRPT_BASE_POLICY
+        env[SRPT_ENV] = "1"
+    if values.get("decode_chunk_cap"):
+        if "decode_chunk_table" not in values:
+            raise ValueError("decode_chunk_cap needs decode_chunk_table (roofline.decode_chunk_table of the config)")
+        if values["decode_chunk_table"]:  # "" = the roofline needs no cap for this config
+            env[DECODE_CHUNK_ENV] = values["decode_chunk_table"]
+    if (SRPT_ENV in env or DECODE_CHUNK_ENV in env) and env.get("SGLANG_PLUGINS"):
+        env["SGLANG_PLUGINS"] += ",green_optimizer"  # a whitelist must let the plugin load
+    if values.get("prefill_delayer_queue_min_ratio") is not None:
+        flags["--enable-prefill-delayer"] = True  # the queue-ratio trigger is read only with the delayer on
     flags["--port"] = port
     argv = [tpl["python"], "-m", "sglang.launch_server", *_flag_args(flags)]
     return argv, env
@@ -103,7 +117,12 @@ def render_scenario(base_yaml: str, wl: Workload, requests: Optional[int] = None
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-def bench_env(wl: Workload, result_dir: str, url: str, scenario: str, port: int) -> Dict[str, str]:
+def served_model_name(tpl: Dict[str, Any]) -> str:
+    return str(tpl["args"]["--served-model-name"])
+
+
+def bench_env(wl: Workload, model: str, result_dir: str, url: str, scenario: str, port: int) -> Dict[str, str]:
+    """``model`` = the server's --served-model-name (also used as the client tokenizer)."""
     b = wl.bench
     assert b is not None
     if wl.concurrency is None:
@@ -116,11 +135,11 @@ def bench_env(wl: Workload, result_dir: str, url: str, scenario: str, port: int)
         "AGENTIC_OUTPUT_DIR": result_dir,
         "RESULT_FILENAME": "result",
         "KV_OFFLOADING": "none",
-        "MODEL": b.model,
+        "MODEL": model,
         "PORT": str(port),
         "CONC": str(wl.concurrency),
         "SERVING_REMOTE_URL": url,
-        "SERVING_TOKENIZER": b.model,
+        "SERVING_TOKENIZER": model,
         "SERVING_DATASET_KIND": b.dataset_kind,
         "SERVING_DATASET": b.dataset,
         "SERVING_SCENARIO_LABEL": b.scenario_label,
@@ -150,13 +169,16 @@ def _metric(rec: Dict[str, Any], name: str) -> Optional[float]:
     return float(v) if isinstance(v, (int, float)) else None
 
 
-def parse_profile_export(path: str) -> Dict[str, Any]:
+def parse_profile_export(path: str, slo: Optional[SLO] = None) -> Dict[str, Any]:
     """Summarise an aiperf ``profile_export.jsonl`` (profiling-phase records only).
 
     ``tok_s_slow`` is the 10th percentile of per-user decode speed (SLO semantics: 90% of
-    users get at least this) and ``tok_s_fast`` its 90th percentile (aiperf's own "p90")."""
+    users get at least this) and ``tok_s_fast`` its 90th percentile (aiperf's own "p90").
+    With ``slo``: ``slo_attainment`` is the fraction of requests whose own TTFT and decode
+    speed both meet the thresholds (a request without a decode speed, e.g. one output
+    token, is judged on TTFT alone) and ``goodput_req_s`` those requests per second."""
     ttft, per_user, tokens = [], [], 0.0
-    n = 0
+    n = good = 0
     t0, t1 = float("inf"), 0.0
     hit_tokens = in_tokens = 0.0
     with open(path) as f:
@@ -180,6 +202,8 @@ def parse_profile_export(path: str) -> Dict[str, Any]:
             u = _metric(rec, "output_token_throughput_per_user")
             if u is not None:
                 per_user.append(u)
+            if slo is not None and tt <= slo.ttft_p90_ms and (u is None or u >= slo.user_tok_s_p90_min):
+                good += 1
             md = rec["metadata"]
             if "request_start_ns" in md:
                 t0 = min(t0, md["request_start_ns"] / 1e9)
@@ -188,7 +212,7 @@ def parse_profile_export(path: str) -> Dict[str, Any]:
     if n == 0 or not per_user or t1 <= t0:
         return {"ok": False, "error": f"no usable profiling records in {path} (n={n})"}
     dur = t1 - t0
-    return {
+    out = {
         "ok": True,
         "n_requests": n,
         "duration_s": dur,
@@ -202,6 +226,10 @@ def parse_profile_export(path: str) -> Dict[str, Any]:
         "tok_s_fast": percentile(per_user, 0.90),
         "cache_hit_rate": hit_tokens / in_tokens if in_tokens else 0.0,
     }
+    if slo is not None:
+        out["slo_attainment"] = good / n
+        out["goodput_req_s"] = good / dur
+    return out
 
 
 # --------------------------------------------------------------------------- processes
@@ -231,11 +259,12 @@ def http_ok(url: str, timeout: float = 5.0) -> bool:
 
 
 class Runner:
-    def __init__(self, tpl: Dict[str, Any], wl: Workload, out_dir: Path, fixed: Optional[Dict[str, Any]] = None):
+    def __init__(self, tpl: Dict[str, Any], wl: Workload, out_dir: Path, fixed: Optional[Dict[str, Any]] = None, slo: Optional[SLO] = None):
         self.tpl = tpl
         self.wl = wl
         self.out_dir = Path(out_dir)
         self.fixed = fixed or {}
+        self.slo = slo
         self.port = int(tpl["port"])
         self.url = f"http://127.0.0.1:{self.port}"
         self.proc: Optional[subprocess.Popen] = None
@@ -273,7 +302,7 @@ class Runner:
         result_dir.mkdir(parents=True, exist_ok=True)
         base = (Path(b.infx_dir) / b.scenario_yaml).read_text()
         scenario = render_scenario(base, self.wl, requests=requests, duration_s=b.max_duration_s)
-        env = {**os.environ, **bench_env(self.wl, str(result_dir), self.url, scenario, self.port)}
+        env = {**os.environ, **bench_env(self.wl, served_model_name(self.tpl), str(result_dir), self.url, scenario, self.port)}
         for step in ("prepare", "run"):
             r = subprocess.run(
                 ["python3", "-m", "infx.serving.client", step],
@@ -289,7 +318,7 @@ class Runner:
         export = result_dir / "aiperf_artifacts" / "profile_export.jsonl"
         if not export.exists():
             return {"ok": False, "error": f"missing {export}"}
-        return parse_profile_export(str(export))
+        return parse_profile_export(str(export), self.slo)
 
     def measure(self, cfg: Dict[str, Any], round_name: str, repeat: int, requests: Optional[int] = None) -> Dict[str, Any]:
         """Restart the server on ``cfg`` and bench it (one process per measurement, as the

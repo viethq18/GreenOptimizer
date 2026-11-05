@@ -1,0 +1,34 @@
+# RedHatAI/gemma-4-31B-it-FP8-block (/network-volume/rnd-sglang/models/gemma-4-31B-it-FP8-block).
+# config.json text_config: 60 layers, every 6th is full attention (10 global, 50 sliding),
+# sliding_window 1024, max_position_embeddings 262144.
+#   sliding: 32 q heads, 16 kv heads, head_dim 256
+#   global:  32 q heads,  4 kv heads, head_dim 512 (attention_k_eq_v; sglang still allocates V:
+#            runs/gemma4/fa4_try1.log "Full KV Cache ... K size: 1.67 GB, V size: 1.67 GB")
+# Parameter counts from the safetensors headers: attention fp8 8.4777G, MLP fp8 20.809G,
+# embedding bf16 1.4093G (tied lm_head, read per decode step), vision tower bf16 0.5757G
+# (not on the text decode path).
+# Memory check against fa4_try1.log (fp8 KV, mem_fraction 0.85, swa ratio 0.8): KV budget
+# 30.04 GiB / (40960 + 0.8 * 409600 B per full token) = 87485 full tokens, 69988 SWA tokens,
+# exactly the logged pool sizes.
+name: gemma-4-31B-it-FP8-block
+served_name: RedHatAI/gemma-4-31B-it-FP8-block
+weight_bytes: 32.1e9          # 29.29e9 fp8 linear (1 B) + 1.4093e9 bf16 tied embedding (2 B)
+weight_gib_resident: 32.63    # fa4_try1.log "Load weight end ... mem usage=32.63 GB"
+active_params: 30.7e9         # dense text model: attention + MLP + lm_head
+max_context: 262144
+attention:
+  - {name: sliding, layers: 50, q_heads: 32, kv_heads: 16, head_dim: 256, window: 1024}
+  - {name: global, layers: 10, q_heads: 32, kv_heads: 4, head_dim: 512}
+unsupported:
+  - when: {attention_backend: [fa4], kv_cache_dtype: [fp8_e4m3]}
+    reason: >
+      FA4 on sm90 asserts "SM90 FA4 FP8 supports head_dim <= 256"
+      (sglang flash_attn/cute/interface.py:759) for the head_dim-512 global layers. The green
+      backend runs this pair (GreenAttention docs/gemma4.md): green fp8 decode and a native fp8
+      extend kernel for those layers, FA4 fp8 for the sliding-layer prefill. On H100 the extend
+      kernel is 1.00-1.03x of FA4 bf16 on chunked prefill shapes, so the roofline costs it as
+      FA4 attention.
+  - when: {attention_backend: [green], kv_cache_dtype: [bfloat16]}
+    reason: >
+      the GreenAttention kernel is fp8-KV only; with bf16 KV its select() declines every call
+      and the server runs FA4, i.e. the same config as attention_backend=fa4.

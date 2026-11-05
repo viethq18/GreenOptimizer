@@ -4,15 +4,19 @@ from pathlib import Path
 
 import pytest
 
+from green_optimizer.plugin import decode_chunk_cap, format_chunk_table, parse_chunk_table
 from green_optimizer.roofline import (
+    CHUNK_GRANULE,
     accept_length,
+    attended_keys,
+    decode_chunk_table,
     memory_plan,
     predict,
     prefill_time,
     resolve_calibration,
     ttft_lower_bound,
 )
-from green_optimizer.spec import ModelSpec, Workload, load_hardware, load_workload
+from green_optimizer.spec import SLO, Workload, load_hardware, load_model, load_workload
 
 ROOT = Path(__file__).resolve().parents[2]
 HW_PATH = str(ROOT / "configs" / "h100.yaml")
@@ -29,7 +33,13 @@ FIELD = {
 
 hw = load_hardware(HW_PATH)
 calib = resolve_calibration(hw, HW_PATH)
-model = ModelSpec()
+model = load_model(str(ROOT / "configs" / "models" / "qwen3.8-27b-fp8.yaml"))
+gemma = load_model(str(ROOT / "configs" / "models" / "gemma-4-31b-it-fp8-block.yaml"))
+GEMMA_CFG = {
+    "attention_backend": "fa4", "kv_cache_dtype": "bfloat16", "chunked_prefill_size": 8192,
+    "max_prefill_tokens": 16384, "max_running_requests": 64, "swa_full_tokens_ratio": 0.8,
+    "schedule_policy": "dfs-weight", "hicache": True, "mem_fraction_static": 0.85,
+}
 
 
 def _cases():
@@ -71,6 +81,21 @@ def test_accept_length_monotone_in_draft_tokens():
     assert vals[0] == 1.0 and vals == sorted(vals)
 
 
+def test_slo_attainment_bounded_and_monotone_in_slo():
+    run = calib.runs[0]
+    wl = Workload(**run.workload)
+    no_slo = predict(run.config, wl, hw, model, calib.params)
+    assert no_slo.slo_attainment is None and no_slo.goodput_req_s is None
+    att = []
+    for scale in (0.25, 0.5, 1.0, 2.0, 8.0):
+        slo = SLO(ttft_p90_ms=no_slo.ttft_p90_ms * scale, user_tok_s_p90_min=no_slo.tok_s_slow / scale)
+        p = predict(run.config, wl, hw, model, calib.params, slo)
+        assert 0.0 <= p.slo_attainment <= 1.0
+        assert p.goodput_req_s == pytest.approx(p.slo_attainment * p.lam)
+        att.append(p.slo_attainment)
+    assert att == sorted(att) and att[0] < att[-1]
+
+
 def test_prefill_time_grows_with_prefix_and_tokens():
     a = prefill_time(8192, 0, hw, model, 0.47)
     assert prefill_time(8192, 16000, hw, model, 0.47) > a
@@ -84,3 +109,61 @@ def test_ttft_lower_bound_livekit_without_hit():
     assert 1.0 < lb["calibrated_s"] < 2.5  # at the measured prefill efficiency; far above the 500 ms SLO
     assert lb["calibrated_s"] > 0.5 * 2
     assert ttft_lower_bound(wl, hw, model, calib.params, hit=0.5)["physical_s"] < lb["physical_s"]
+
+
+def test_gemma_memory_plan_reproduces_sglang_hybrid_swa_pool():
+    # runs/gemma4/fa4_try1.log: fp8 KV, KV budget 30.04 GiB -> 87485 full / 69988 SWA tokens
+    p = calib.params.model_copy(update={"reserved_gib": 0.85 * hw.hbm_gib - gemma.weight_gib_resident - 30.04})
+    m = memory_plan({**GEMMA_CFG, "kv_cache_dtype": "fp8_e4m3"}, hw, gemma, p)
+    assert m["kv_tokens"] == pytest.approx(87485, rel=1e-3)
+    assert m["swa_tokens"] == int(m["kv_tokens"] * 0.8)
+    assert m["mamba_slots"] == 0 and m["max_requests_by_mamba"] is None
+
+
+def test_attended_keys_window_boundaries():
+    assert attended_keys(100, 0, None) == attended_keys(100, 0, 10**6) == 5000
+    assert attended_keys(100, 2000, 1024) == 100 * 1024  # whole chunk past the window
+    # additive across the window edge: [900, 1100) == [900, 1024) + [1024, 1100)
+    assert attended_keys(200, 900, 1024) == pytest.approx(attended_keys(124, 900, 1024) + attended_keys(76, 1024, 1024))
+    assert attended_keys(200, 900, 1024) < attended_keys(200, 900, None)
+
+
+def test_gemma_runnable_backend_kv_pairs():
+    wl = load_workload(str(ROOT / "configs" / "workloads" / "livekit.yaml"))
+    fa4_fp8 = predict({**GEMMA_CFG, "kv_cache_dtype": "fp8_e4m3"}, wl, hw, gemma, calib.params)
+    assert not fa4_fp8.feasible and "head_dim <= 256" in fa4_fp8.reason
+    green_bf16 = predict({**GEMMA_CFG, "attention_backend": "green"}, wl, hw, gemma, calib.params)
+    assert not green_bf16.feasible and "fp8-KV only" in green_bf16.reason
+    green_fp8 = {**GEMMA_CFG, "attention_backend": "green", "kv_cache_dtype": "fp8_e4m3"}
+    assert predict(green_fp8, wl, hw, gemma, calib.params).feasible
+    assert predict(GEMMA_CFG, wl, hw, gemma, calib.params).feasible
+
+
+def test_gemma_swa_pool_below_window_is_infeasible_and_small_pool_caps_running():
+    wl = load_workload(str(ROOT / "configs" / "workloads" / "livekit.yaml"))
+    tiny = predict({**GEMMA_CFG, "swa_full_tokens_ratio": 0.001}, wl, hw, gemma, calib.params)
+    assert not tiny.feasible and "SWA pool" in tiny.reason
+    small = predict({**GEMMA_CFG, "swa_full_tokens_ratio": 0.01, "max_running_requests": 128}, wl, hw, gemma, calib.params)
+    swa_per_req = 1024 + 128  # min(ctx, window) + eviction interval; livekit ctx >> window
+    assert small.feasible and small.running <= 0.6 * small.swa_tokens / swa_per_req
+    balanced = predict({**GEMMA_CFG, "swa_full_tokens_ratio": 0.05, "max_running_requests": 128}, wl, hw, gemma, calib.params)
+    assert balanced.running > small.running
+
+
+def test_decode_chunk_table_is_a_valid_plugin_table_tightening_with_the_slo():
+    wl = load_workload(str(ROOT / "configs" / "workloads" / "livekit.yaml"))
+    cfg = calib.runs[0].config
+
+    def table(tok_s):
+        rows = decode_chunk_table(cfg, wl, hw, model, calib.params, SLO(ttft_p90_ms=2000, user_tok_s_p90_min=tok_s))
+        assert parse_chunk_table(format_chunk_table(rows)) == tuple(rows)  # the plugin accepts it
+        assert all(c % CHUNK_GRANULE == 0 and c < cfg["chunked_prefill_size"] for _, c in rows)
+        return rows
+
+    assert table(1.0) == []  # every chunk already meets a lax SLO
+    assert table(100.0) == []  # decode alone misses it: no chunk can help, none is sacrificed
+    loose, strict = table(10.0), table(12.0)
+    assert len(loose) >= 2  # the cap falls as the running batch grows
+    for b in range(1, 21):  # decode alone meets both SLOs here
+        lc, sc = decode_chunk_cap(tuple(loose), b), decode_chunk_cap(tuple(strict), b)
+        assert sc is not None and (lc is None or sc <= lc)

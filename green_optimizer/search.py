@@ -3,12 +3,13 @@
 Round structure (plan O1):
   prefilter   roofline over the whole space; drop configs predicted to violate the SLO by
               more than ``slack`` (20%)
-  round 1     top-K by predicted throughput, 200 requests each
+  round 1     top-K by the objective (``objective.rank_key``), 200 requests each
   round 2     full bench for the top 25% of round 1
   knob sweep  ``UNMODELLED`` knobs (not in the roofline) varied one at a time around the
               round-2 winner, full bench
   round 3     top 3, repeated 3 times, median of the repeats
 The measurement function is injected (``Measure``) so the logic is unit-testable without a GPU.
+The default objective ``balanced`` is the original ranking: SLO first, then total tok/s.
 """
 
 from __future__ import annotations
@@ -18,10 +19,14 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .objective import OBJECTIVES, Shape, auto_objective, rank_key
+from .plugin import DEFAULT_AGE, DEFAULT_SHARE, MIN_SHARE, SRPT_POLICY
 from .roofline import CalibParams, Prediction, predict
 from .spec import (
     ONLINE_KNOBS,
+    OPT_IN_SPACE,
     SLO,
+    SRPT_ONLINE_KNOBS,
     Hardware,
     ModelSpec,
     SearchSpace,
@@ -30,9 +35,16 @@ from .spec import (
 )
 
 # knobs the roofline does not model: their effect is decided by measurement only
-UNMODELLED = ("max_prefill_tokens", "schedule_policy")
-# default for each unmodelled knob while ranking (the production launch.sh values)
-UNMODELLED_DEFAULTS = {"max_prefill_tokens": 16384, "schedule_policy": "dfs-weight"}
+UNMODELLED = ("max_prefill_tokens", "schedule_policy", *OPT_IN_SPACE)
+# default for each unmodelled knob while ranking (the production launch.sh values; sglang's for opt-in knobs)
+UNMODELLED_DEFAULTS = {"max_prefill_tokens": 16384, "schedule_policy": "dfs-weight", **{k: v[0] for k, v in OPT_IN_SPACE.items()}}
+
+
+def unmodelled_defaults(space: SearchSpace) -> Dict[str, Any]:
+    """``UNMODELLED_DEFAULTS`` restricted to the knobs ``space`` puts in its configs."""
+    return {k: v for k, v in UNMODELLED_DEFAULTS.items() if k not in OPT_IN_SPACE or k in space.space}
+
+
 SLACK = 0.20
 ROUND1_K = 24
 ROUND1_REQUESTS = 200
@@ -47,10 +59,16 @@ class Candidate:
     cfg: Dict[str, Any]
     pred: Prediction
     violation: float  # SLO violation of the prediction (0 = met)
+    rank: Tuple[int, float] = (2, math.inf)  # objective.rank_key of the prediction
 
     @property
     def key(self) -> str:
         return config_key(self.cfg)
+
+    @property
+    def metrics(self) -> Dict[str, Any]:
+        p = self.pred
+        return {"ok": p.feasible, "ttft_p90_ms": p.ttft_p90_ms, "tok_s_slow": p.tok_s_slow, "throughput_tok_s": p.total_tok_s, "goodput_req_s": p.goodput_req_s}
 
 
 def modelled_key(cfg: Dict[str, Any]) -> str:
@@ -70,46 +88,57 @@ def prefilter(
     hw: Hardware,
     model: ModelSpec,
     params: CalibParams,
+    objective: str = "balanced",
 ) -> List[Candidate]:
-    """Predict every distinct modelled config; sorted best first.
+    """Predict every distinct modelled config; sorted best first under ``objective``.
 
-    Order: configs within SLO (+slack) first by predicted throughput, then the rest by
-    increasing violation (so the head of the list is also the best-effort frontier).
+    For ``balanced``: configs within SLO (+slack) first by predicted throughput, then the
+    rest by increasing violation (so the head of the list is also the best-effort frontier).
     """
     seen = set()
     out: List[Candidate] = []
+    defaults = unmodelled_defaults(space)
     for cfg in space.configs():
-        cfg = {**cfg, **UNMODELLED_DEFAULTS}
+        cfg = {**cfg, **defaults}
         if config_key(cfg) in seen:
             continue
         seen.add(config_key(cfg))
-        pred = predict(cfg, wl, hw, model, params)
+        pred = predict(cfg, wl, hw, model, params, slo)
         out.append(Candidate(cfg, pred, _violation(slo, pred)))
-    out.sort(key=lambda c: _rank_key(c))
-    return out
+    return rerank(out, slo, objective)
 
 
-def _rank_key(c: Candidate) -> Tuple[int, float]:
-    if not c.pred.feasible:
-        return (2, math.inf)
-    if c.violation <= SLACK:
-        return (0, -c.pred.total_tok_s)
-    return (1, c.violation)
+def rerank(cands: Sequence[Candidate], slo: SLO, objective: str) -> List[Candidate]:
+    for c in cands:
+        c.rank = rank_key(objective, slo, c.metrics, SLACK)
+    return sorted(cands, key=lambda c: c.rank)
 
 
 def passing(cands: Sequence[Candidate]) -> List[Candidate]:
+    """Configs predicted to meet the SLO within the slack (whatever the objective)."""
     return [c for c in cands if c.pred.feasible and c.violation <= SLACK]
 
 
+def measure_pool(cands: Sequence[Candidate]) -> List[Candidate]:
+    """Configs worth measuring: the objective's acceptable tier, else the best-effort frontier."""
+    return [c for c in cands if c.rank[0] == 0] or list(cands)
+
+
+def choose_objective(mode: str, cands: Sequence[Candidate]) -> Tuple[str, str]:
+    """Resolve ``auto`` from the shape of the workload as predicted for the top config of a
+    ``balanced`` ranking ``cands``; any other mode is returned unchanged."""
+    if mode != "auto":
+        return mode, ""
+    if not cands or not cands[0].pred.feasible:
+        return auto_objective(Shape(0.0, 0.0, 0.0, slo_feasible=False))
+    p = cands[0].pred
+    return auto_objective(Shape(p.lam * p.wait_ms / 1e3, p.ttft_mean_ms, p.decode_ms, slo_feasible=bool(passing(cands))))
+
+
 # --------------------------------------------------------------------------- halving
-def score_key(slo: SLO, m: Measurement) -> Tuple[int, float]:
-    """Sort key of a measurement (smaller is better): SLO-met by throughput, else by violation."""
-    if not m.get("ok", False):
-        return (2, math.inf)
-    v = slo.violation(m["ttft_p90_ms"], m["tok_s_slow"])
-    if v <= 0:
-        return (0, -m["throughput_tok_s"])
-    return (1, v)
+def score_key(slo: SLO, m: Measurement, objective: str = "balanced") -> Tuple[int, float]:
+    """Sort key of a measurement (smaller is better), see ``objective.rank_key``."""
+    return rank_key(objective, slo, m)
 
 
 def median_measurement(ms: Sequence[Measurement]) -> Measurement:
@@ -132,8 +161,8 @@ class SearchResult:
     slo_met: bool = False
 
 
-def _rank(slo: SLO, rows: List[Tuple[Dict[str, Any], Measurement]]) -> List[Tuple[Dict[str, Any], Measurement]]:
-    return sorted(rows, key=lambda r: score_key(slo, r[1]))
+def _rank(slo: SLO, rows: List[Tuple[Dict[str, Any], Measurement]], objective: str = "balanced") -> List[Tuple[Dict[str, Any], Measurement]]:
+    return sorted(rows, key=lambda r: score_key(slo, r[1], objective))
 
 
 def unmodelled_variants(cfg: Dict[str, Any], space: SearchSpace) -> List[Dict[str, Any]]:
@@ -155,6 +184,7 @@ def successive_halving(
     top_final: int = 3,
     repeats: int = ROUND3_REPEATS,
     on_result: Optional[Callable[[str, Dict[str, Any], Measurement], None]] = None,
+    objective: str = "balanced",
 ) -> SearchResult:
     res = SearchResult()
 
@@ -168,13 +198,13 @@ def successive_halving(
         res.rounds.setdefault(round_name, []).extend(rows)
         return rows
 
-    r1 = _rank(slo, run("round1", [c.cfg for c in cands[:k]]))
+    r1 = _rank(slo, run("round1", [c.cfg for c in cands[:k]]), objective)
     n2 = max(top_final, math.ceil(len(r1) * keep_fraction))
-    r2 = _rank(slo, run("round2", [cfg for cfg, m in r1[:n2] if m.get("ok", False)]))
+    r2 = _rank(slo, run("round2", [cfg for cfg, m in r1[:n2] if m.get("ok", False)]), objective)
     if not r2 or not r2[0][1].get("ok", False):
         return res
     sweep = run("knob_sweep", unmodelled_variants(r2[0][0], space))
-    pool = _rank(slo, r2 + sweep)
+    pool = _rank(slo, r2 + sweep, objective)
     finalists = [cfg for cfg, m in pool[:top_final] if m.get("ok", False)]
     final_rows = []
     for cfg in finalists:
@@ -184,10 +214,10 @@ def successive_halving(
                 on_result("round3", cfg, {**m, "repeat": i})
         final_rows.append((cfg, median_measurement(reps)))
     res.rounds["round3"] = final_rows
-    final_rows = _rank(slo, final_rows)
+    final_rows = _rank(slo, final_rows, objective)
     if final_rows and final_rows[0][1].get("ok", False):
         res.winner, res.winner_measurement = final_rows[0]
-        res.slo_met = score_key(slo, res.winner_measurement)[0] == 0
+        res.slo_met = slo.violation(res.winner_measurement["ttft_p90_ms"], res.winner_measurement["tok_s_slow"]) <= 0
     return res
 
 
@@ -222,32 +252,78 @@ def build_ladder(
     params: CalibParams,
     space: SearchSpace,
     measured: Optional[Dict[str, Measurement]] = None,
+    objective: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Pareto ladder over online knobs, ordered TTFT-priority -> throughput-priority.
 
     Each rung carries the metrics it was ranked by and ``source``: ``measured`` when
     ``measured`` (config_key -> Measurement) has the exact config, else ``roofline``.
+    Rungs are drawn from the SLO-meeting variants when there are any, except for the
+    ``throughput`` objective, which ignores the SLO. With an ``objective`` the rungs also
+    carry ``goodput_req_s`` (for ``ladder_homes``); without one the ladder is the original.
+    A green-srpt ``base`` also gets srpt knobs on every rung and ``with_srpt_rungs`` below
+    rung 0; any other base gets the original ladder.
     """
     measured = measured or {}
     rows: List[Dict[str, Any]] = []
     for cfg in online_variants(base, space):
         m = measured.get(config_key(cfg))
         if m is not None and m.get("ok", False):
-            row = {"ttft_p90_ms": m["ttft_p90_ms"], "tok_s_slow": m["tok_s_slow"], "throughput_tok_s": m["throughput_tok_s"], "source": "measured"}
+            row = {"ttft_p90_ms": m["ttft_p90_ms"], "tok_s_slow": m["tok_s_slow"], "throughput_tok_s": m["throughput_tok_s"], "goodput_req_s": m.get("goodput_req_s"), "source": "measured"}
         else:
-            pr = predict(cfg, wl, hw, model, params)
+            pr = predict(cfg, wl, hw, model, params, slo)
             if not pr.feasible:
                 continue
-            row = {"ttft_p90_ms": pr.ttft_p90_ms, "tok_s_slow": pr.tok_s_slow, "throughput_tok_s": pr.total_tok_s, "source": "roofline"}
+            row = {"ttft_p90_ms": pr.ttft_p90_ms, "tok_s_slow": pr.tok_s_slow, "throughput_tok_s": pr.total_tok_s, "goodput_req_s": pr.goodput_req_s, "source": "roofline"}
         row["violation"] = slo.violation(row["ttft_p90_ms"], row["tok_s_slow"])
         row["online"] = {k: cfg[k] for k in ONLINE_KNOBS}
+        if objective is None:
+            del row["goodput_req_s"]
         rows.append(row)
     met = [r for r in rows if r["violation"] <= 0]
-    pool = met if met else rows
+    pool = met if met and objective != "throughput" else rows
     ladder = pareto_front(pool, minimise="ttft_p90_ms", maximise="tok_s_slow")
     # ties on the front's metrics: the rung that keeps the larger chunk/cap is more throughput-oriented
     ladder.sort(key=lambda r: (r["ttft_p90_ms"], -r["tok_s_slow"]))
+    if base.get("schedule_policy") == SRPT_POLICY:
+        ladder = with_srpt_rungs(ladder)
     for i, r in enumerate(ladder):
         r["rung"] = i
         r["slo_met"] = r["violation"] <= 0
     return ladder
+
+
+SRPT_SOURCE = "srpt"  # ladder rungs past the modelled TTFT end (green-srpt is unmodelled)
+SRPT_TIGHTEN_STEPS = 2
+
+
+def srpt_levels(steps: int = SRPT_TIGHTEN_STEPS) -> List[Tuple[float, float]]:
+    """green-srpt ``(age, min_share)`` from the plugin's startup values (index 0), halving
+    both per step. A smaller ``min_share`` hands more of a long prompt's chunk to the short
+    prompts queued behind it; a smaller ``age`` keeps short prompts ahead for longer. Both
+    favour the short majority (TTFT p90) over the longest prompts, whose worst-case wait
+    (``(w - s) / age`` prefill tokens, plugin.py) doubles per step: bounded, never age 0."""
+    return [(DEFAULT_AGE / 2**i, max(MIN_SHARE, DEFAULT_SHARE / 2**i)) for i in range(steps + 1)]
+
+
+def with_srpt_rungs(ladder: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every rung keeps the startup srpt values; tightened srpt rungs on rung 0's chunk/cap
+    go below it, so the controller reaches for them only once the modelled ladder has no
+    more TTFT to give. Their metrics are rung 0's (source ``srpt``: not modelled)."""
+    if not ladder:
+        return ladder
+    (age0, share0), *tight = srpt_levels()
+    for r in ladder:
+        r["online"].update(zip(SRPT_ONLINE_KNOBS, (age0, share0)))
+    extra = [{**ladder[0], "online": {**ladder[0]["online"], **dict(zip(SRPT_ONLINE_KNOBS, lv))}, "source": SRPT_SOURCE} for lv in reversed(tight)]
+    return extra + ladder
+
+
+def ladder_homes(ladder: Sequence[Dict[str, Any]], slo: SLO) -> Dict[str, int]:
+    """The rung each objective prefers (its ``rank_key`` minimum over the ladder): where the
+    controller starts and where it drifts back to while the SLO holds."""
+    if not ladder:
+        return {}
+    # srpt rungs are a TTFT escape hatch, not a place to stay: their metrics are copies
+    modelled = [r for r in ladder if r.get("source") != SRPT_SOURCE]
+    return {o: min(modelled, key=lambda r: (rank_key(o, slo, {**r, "ok": True}), r["rung"]))["rung"] for o in OBJECTIVES}

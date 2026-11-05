@@ -64,7 +64,6 @@ class BenchSpec(_Strict):
     dataset_kind: str = "file"  # SERVING_DATASET_KIND
     infx_dir: str = "/network-volume/rnd-sglang/InferenceX-wt-livekit/inferencex-e2e"
     aiperf_runtime_dir: str = "/network-volume/rnd-sglang/.aiperf-runtime-livekit"
-    model: str = "Qwen/Qwen3.8-27B-FP8"
     # synthetic scenarios: dataset isl/osl are rewritten into the scenario yaml
     synthetic_isl: Optional[int] = None
     synthetic_osl: Optional[int] = None
@@ -131,34 +130,99 @@ class Hardware(_Strict):
         return self.hbm_bw_tbs * 1e12
 
 
-class ModelSpec(_Strict):
-    """Qwen3.8-27B-FP8 hybrid (config.json of /network-volume/rnd-sglang/models/)."""
+class AttnGroup(_Strict):
+    """Layers sharing one attention shape. ``window`` = sliding window in tokens (None = full)."""
 
-    name: str = "Qwen3.8-27B-FP8"
-    weight_bytes: float = 27e9  # FP8 weights read once per decode step
-    weight_gib_resident: float = 28.39  # server_native.log "weights" (incl. scales/embeds)
-    active_params: float = 27e9  # 2 FLOPs per param per token
-    full_attn_layers: int = 16
-    gdn_layers: int = 48
-    q_heads: int = 24
-    kv_heads: int = 4
-    head_dim: int = 256
-    # GDN recurrent state, fp32: 141.5 MiB per slot (server_native.log: 21.94 GiB / 155 slots)
-    gdn_state_bytes_fp32: float = 148.4e6
-    # conv state + replayssm intermediate window per slot (0.43 + 0.29 GiB / 155 slots)
-    gdn_extra_bytes_per_slot: float = 4.9e6
-    mamba_slots_per_request: int = 3
-    draft_weight_gib: float = 3.69  # DFlash2 draft model
-    draft_kv_bytes_per_token: float = 19.0e3  # bf16 K+V of the draft, per token
-    # decode: a 1-token step reads weights; draft model is read once per step when spec is on
-    max_context: int = 256000
+    name: str
+    layers: int = Field(gt=0)
+    q_heads: int = Field(gt=0)
+    kv_heads: int = Field(gt=0)
+    head_dim: int = Field(gt=0)
+    window: Optional[int] = Field(default=None, gt=0)
 
     def kv_bytes_per_token(self, kv_dtype: str) -> float:
+        """K + V bytes of one token over all layers of the group."""
         elem = 1 if kv_dtype.startswith("fp8") else 2
-        return 2 * self.full_attn_layers * self.kv_heads * self.head_dim * elem
+        return 2 * self.layers * self.kv_heads * self.head_dim * elem
 
-    def gdn_state_bytes(self, ssm_dtype: str) -> float:
-        return self.gdn_state_bytes_fp32 * (0.5 if ssm_dtype == "bfloat16" else 1.0)
+
+class GdnSpec(_Strict):
+    """Linear-attention (GDN / mamba) state held in sglang's mamba pool."""
+
+    layers: int = Field(gt=0)
+    state_bytes_fp32: float = Field(gt=0)  # recurrent state per slot, fp32
+    extra_bytes_per_slot: float = Field(ge=0)  # conv state + replay window per slot
+    slots_per_request: int = Field(gt=0)
+
+    def state_bytes(self, ssm_dtype: str) -> float:
+        return self.state_bytes_fp32 * (0.5 if ssm_dtype == "bfloat16" else 1.0)
+
+
+class DraftSpec(_Strict):
+    """Speculative-decoding draft model (read once per step when spec is on)."""
+
+    weight_gib: float = Field(gt=0)
+    kv_bytes_per_token: float = Field(ge=0)
+
+
+class Unsupported(_Strict):
+    """Knob combination that cannot run for this model: ``when`` matches a config if every
+    listed knob takes one of the listed values. ``predict`` reports it infeasible with ``reason``."""
+
+    when: Dict[str, List[Any]]
+    reason: str
+
+    def matches(self, cfg: Dict[str, Any]) -> bool:
+        return all(cfg.get(k) in vals for k, vals in self.when.items())
+
+
+class ModelSpec(_Strict):
+    """Served model, loaded from ``configs/models/*.yaml`` (provenance comments live there)."""
+
+    name: str
+    served_name: str  # must equal the launch template's --served-model-name
+    weight_bytes: float = Field(gt=0)  # bytes read once per decode step
+    weight_gib_resident: float = Field(gt=0)  # sglang "Load weight end ... mem usage"
+    active_params: float = Field(gt=0)  # 2 FLOPs per param per token
+    max_context: int = Field(gt=0)
+    attention: List[AttnGroup] = Field(min_length=1)
+    gdn: Optional[GdnSpec] = None
+    draft: Optional[DraftSpec] = None
+    unsupported: List[Unsupported] = Field(default_factory=list)
+
+    @property
+    def full_groups(self) -> List[AttnGroup]:
+        return [g for g in self.attention if g.window is None]
+
+    @property
+    def swa_groups(self) -> List[AttnGroup]:
+        return [g for g in self.attention if g.window is not None]
+
+    @property
+    def window(self) -> Optional[int]:
+        """Sliding window of the SWA pool (sglang has one window per model)."""
+        ws = {g.window for g in self.swa_groups}
+        return ws.pop() if ws else None
+
+    @model_validator(mode="after")
+    def _one_window(self) -> "ModelSpec":
+        if len({g.window for g in self.swa_groups}) > 1:
+            raise ValueError("sglang's hybrid SWA pool supports one sliding window per model")
+        if not self.full_groups:
+            raise ValueError("at least one full-attention group is required (sglang sizes the pool by it)")
+        return self
+
+    def full_kv_bytes_per_token(self, kv_dtype: str) -> float:
+        return sum(g.kv_bytes_per_token(kv_dtype) for g in self.full_groups)
+
+    def swa_kv_bytes_per_token(self, kv_dtype: str) -> float:
+        return sum(g.kv_bytes_per_token(kv_dtype) for g in self.swa_groups)
+
+    def unsupported_reason(self, cfg: Dict[str, Any]) -> Optional[str]:
+        for u in self.unsupported:
+            if u.matches(cfg):
+                return u.reason
+        return None
 
 
 # --------------------------------------------------------------------------- search space
@@ -173,28 +237,75 @@ DEFAULT_SPACE: Dict[str, List[Any]] = {
     "max_running_requests": [16, 32, 48, 64, 128],
     "mamba_ssm_dtype": ["float32", "bfloat16"],
     "mamba_full_memory_ratio": [3, 5, 8],
+    # SWA pool tokens / full pool tokens (sglang --swa-full-tokens-ratio, default 0.8)
+    "swa_full_tokens_ratio": [0.8, 0.4, 0.2, 0.1, 0.05],
     "speculative_num_draft_tokens": [SPEC_OFF, 2, 4, 8],
+    # opt-in extra value: "green-srpt" (shortest-prefill-first + aging + chunk sharing, plugin.py),
+    # list it in a --space yaml to search it
     "schedule_policy": ["dfs-weight", "lpm", "fcfs"],
     "hicache": [True, False],
 }
 
+# Opt-in knobs: searched only when listed in a --space yaml; otherwise absent from every config,
+# so no flag reaches the server and the default search is unchanged. First value = the default
+# behaviour (sglang's, or no plugin feature).
+OPT_IN_SPACE: Dict[str, List[Any]] = {
+    # --enable-mixed-chunk: decode requests ride along in prefill-chunk batches
+    "enable_mixed_chunk": [False, True],
+    # --prefill-decode-interval: decode rounds after a prefill batch before the next one
+    # (None = flag not passed, sglang's per-model default)
+    "prefill_decode_interval": [None, 4, 8, 16],
+    # --enable-prefill-delayer with --prefill-delayer-queue-min-ratio (None = delayer off)
+    "prefill_delayer_queue_min_ratio": [None, 0.1, 0.3, 0.5],
+    # GreenOptimizer plugin: per-running-batch chunk cap from roofline.decode_chunk_table
+    "decode_chunk_cap": [False, True],
+}
+
+# sglang's value when --swa-full-tokens-ratio is not given (server_args.py)
+SWA_FULL_TOKENS_RATIO_DEFAULT = 0.8
+
 # knobs that can change while the server runs (O2 ladder); everything else needs a restart
 ONLINE_KNOBS = ("chunked_prefill_size", "max_running_requests")
+# extra rung knobs of a green-srpt ladder (plugin keys green_srpt_age / green_srpt_min_share)
+SRPT_ONLINE_KNOBS = ("srpt_age", "srpt_min_share")
+
+
+def inapplicable_knobs(model: "ModelSpec") -> Dict[str, str]:
+    """Knobs the model has no use for -> why. They are left out of every config, so no flag
+    is passed to the server for them."""
+    out: Dict[str, str] = {}
+    if model.gdn is None:
+        out["mamba_ssm_dtype"] = out["mamba_full_memory_ratio"] = "no GDN/mamba layers"
+    if not model.swa_groups:
+        out["swa_full_tokens_ratio"] = "no sliding-window layers"
+    if model.draft is None:
+        out["speculative_num_draft_tokens"] = "no draft model configured (speculative decoding off)"
+    return out
 
 
 class SearchSpace(_Strict):
     space: Dict[str, List[Any]] = Field(default_factory=lambda: {k: list(v) for k, v in DEFAULT_SPACE.items()})
     fixed: Dict[str, Any] = Field(default_factory=lambda: {"mem_fraction_static": 0.85})
+    # knob -> reason; set by for_model(), excluded from configs()
+    excluded: Dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _known(self) -> "SearchSpace":
-        unknown = set(self.space) - set(DEFAULT_SPACE)
+        unknown = (set(self.space) | set(self.excluded)) - set(DEFAULT_SPACE) - set(OPT_IN_SPACE)
         if unknown:
             raise ValueError(f"unknown search-space knob(s): {sorted(unknown)}")
         for k, vals in self.space.items():
             if not vals:
                 raise ValueError(f"search-space knob {k} has no candidate values")
+        both = set(self.space) & set(self.excluded)
+        if both:
+            raise ValueError(f"knob(s) both searched and excluded: {sorted(both)}")
         return self
+
+    def for_model(self, model: "ModelSpec") -> "SearchSpace":
+        """Copy without the knobs ``model`` cannot use (see ``inapplicable_knobs``)."""
+        drop = {**self.excluded, **inapplicable_knobs(model)}
+        return SearchSpace(space={k: v for k, v in self.space.items() if k not in drop}, fixed=dict(self.fixed), excluded=drop)
 
     def size(self) -> int:
         n = 1
@@ -203,9 +314,10 @@ class SearchSpace(_Strict):
         return n
 
     def configs(self) -> Iterator[Dict[str, Any]]:
-        """Every combination; unsearched knobs take the first DEFAULT_SPACE value."""
-        keys = list(DEFAULT_SPACE)
-        pools = [self.space.get(k, DEFAULT_SPACE[k][:1]) for k in keys]
+        """Every combination; unsearched knobs take the first DEFAULT_SPACE value, excluded
+        knobs and unlisted ``OPT_IN_SPACE`` knobs are absent."""
+        keys = [k for k in DEFAULT_SPACE if k not in self.excluded] + [k for k in OPT_IN_SPACE if k in self.space]
+        pools = [self.space[k] if k in self.space else DEFAULT_SPACE[k][:1] for k in keys]
         for combo in itertools.product(*pools):
             cfg = dict(zip(keys, combo))
             cfg.update(self.fixed)
@@ -228,6 +340,10 @@ def load_slo(path: Union[str, Path]) -> SLO:
 
 def load_hardware(path: Union[str, Path]) -> Hardware:
     return Hardware.model_validate(_load_yaml(path))
+
+
+def load_model(path: Union[str, Path]) -> ModelSpec:
+    return ModelSpec.model_validate(_load_yaml(path))
 
 
 def load_space(path: Union[str, Path]) -> SearchSpace:

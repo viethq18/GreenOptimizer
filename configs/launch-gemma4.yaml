@@ -1,0 +1,40 @@
+# Launch template for runner.py, modelled on /network-volume/rnd-sglang/runs/gemma4/launch.sh.
+# Same structure as launch.yaml. No mamba/spec knobs (the model has neither); they are excluded
+# from the search, so no flag for them is ever emitted.
+cwd: /
+python: /usr/bin/python
+env:
+  CUDA_HOME: /usr/local/cuda-13.0
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  PYTHONPATH: /network-volume/rnd-sglang/sglang/python
+  CUDA_VISIBLE_DEVICES: "0"
+port: 30000
+ready_timeout_s: 1800
+args:
+  --model-path: /network-volume/rnd-sglang/models/gemma-4-31B-it-FP8-block
+  --served-model-name: RedHatAI/gemma-4-31B-it-FP8-block
+  --tp-size: 1
+  # livekit: max ISL 39986 + max OSL 289 > 32768 (launch.sh default)
+  --context-length: 65536
+  --enable-metrics: true
+  --enable-cache-report: true
+  --host: 0.0.0.0
+knob_flags:
+  attention_backend: --attention-backend
+  kv_cache_dtype: --kv-cache-dtype
+  chunked_prefill_size: --chunked-prefill-size
+  max_prefill_tokens: --max-prefill-tokens
+  max_running_requests: --max-running-requests
+  swa_full_tokens_ratio: --swa-full-tokens-ratio
+  schedule_policy: --schedule-policy
+  mem_fraction_static: --mem-fraction-static
+  enable_mixed_chunk: --enable-mixed-chunk
+  prefill_decode_interval: --prefill-decode-interval
+  prefill_delayer_queue_min_ratio: --prefill-delayer-queue-min-ratio
+hicache_args:
+  --enable-hierarchical-cache: true
+  --hicache-size: 64
+spec_args: {}
+# env added when attention_backend == green
+green_env:
+  SGLANG_PLUGINS: green_attention

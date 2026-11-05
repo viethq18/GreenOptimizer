@@ -6,7 +6,7 @@ from green_optimizer import search as S
 from green_optimizer.roofline import resolve_calibration
 from green_optimizer.spec import (
     SLO,
-    ModelSpec,
+    load_model,
     SearchSpace,
     config_key,
     load_hardware,
@@ -20,6 +20,7 @@ calib = resolve_calibration(hw, str(ROOT / "configs" / "h100.yaml"))
 wl = load_workload(str(ROOT / "configs" / "workloads" / "livekit.yaml"))
 slo = load_slo(str(ROOT / "configs" / "slo" / "example.yaml"))
 SLO_ = SLO(ttft_p90_ms=1000, user_tok_s_p90_min=50)
+QWEN = load_model(str(ROOT / "configs" / "models" / "qwen3.8-27b-fp8.yaml"))
 
 
 def test_pareto_front_drops_dominated_and_duplicates():
@@ -39,6 +40,27 @@ def test_score_key_orders_met_by_throughput_then_by_violation():
     bad = {"ok": False}
     order = sorted([a, b, c, d, bad], key=lambda m: S.score_key(SLO_, m))
     assert order == [b, a, d, c, bad]
+
+
+def test_objectives_pick_different_winners():
+    a = {"ok": True, "ttft_p90_ms": 800, "tok_s_slow": 60, "throughput_tok_s": 100, "goodput_req_s": 5.0}
+    b = {"ok": True, "ttft_p90_ms": 900, "tok_s_slow": 80, "throughput_tok_s": 200, "goodput_req_s": 3.0}
+    c = {"ok": True, "ttft_p90_ms": 300, "tok_s_slow": 55, "throughput_tok_s": 50, "goodput_req_s": 4.0}
+    v = {"ok": True, "ttft_p90_ms": 2000, "tok_s_slow": 60, "throughput_tok_s": 999, "goodput_req_s": 6.0}
+    best = {o: min([a, b, c, v], key=lambda m: S.score_key(SLO_, m, o)) for o in ("balanced", "ttft", "itl", "goodput", "throughput")}
+    assert best == {"balanced": b, "ttft": c, "itl": b, "goodput": v, "throughput": v}
+    # SLO-tiered modes never prefer a violating config; goodput without a value falls back to the violation
+    assert S.score_key(SLO_, v, "ttft")[0] == 1
+    assert S.score_key(SLO_, {**v, "goodput_req_s": None}, "goodput") == (1, SLO_.violation(2000, 60))
+
+
+def test_ladder_homes_follow_each_objective():
+    rows = [
+        {"rung": 0, "ttft_p90_ms": 300, "tok_s_slow": 55, "throughput_tok_s": 50, "goodput_req_s": 2.0},
+        {"rung": 1, "ttft_p90_ms": 600, "tok_s_slow": 70, "throughput_tok_s": 300, "goodput_req_s": 4.0},
+        {"rung": 2, "ttft_p90_ms": 900, "tok_s_slow": 90, "throughput_tok_s": 250, "goodput_req_s": 3.0},
+    ]
+    assert S.ladder_homes(rows, SLO_) == {"balanced": 1, "ttft": 0, "itl": 2, "goodput": 1, "throughput": 1}
 
 
 def test_median_measurement_ignores_failures():
@@ -63,27 +85,39 @@ def _small_space():
             "hicache": [True],
         },
         fixed={"mem_fraction_static": 0.85},
-    )
+    ).for_model(QWEN)
 
 
 def test_prefilter_dedupes_unmodelled_knobs_and_sorts():
     sp = _small_space()
-    cands = S.prefilter(sp, wl, slo, hw, ModelSpec(), calib.params)
+    cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)
     assert len(cands) == sp.size() // 4  # max_prefill_tokens x schedule_policy collapse
     keys = {config_key(c.cfg) for c in cands}
     assert len(keys) == len(cands)
-    ranks = [S._rank_key(c) for c in cands]
+    ranks = [c.rank for c in cands]
     assert ranks == sorted(ranks)
 
 
 def test_prefilter_example_slo_is_infeasible_on_livekit():
-    cands = S.prefilter(_small_space(), wl, slo, hw, ModelSpec(), calib.params)
+    cands = S.prefilter(_small_space(), wl, slo, hw, QWEN, calib.params)
     assert S.passing(cands) == []  # TTFT p90 < 500 ms at ISL 21k is not reachable
+
+
+def test_opt_in_knobs_absent_by_default_swept_when_listed():
+    assert not set(S.OPT_IN_SPACE) & set(next(SearchSpace().for_model(QWEN).configs()))
+    sp = SearchSpace(space={**_small_space().space, "enable_mixed_chunk": [False, True], "prefill_decode_interval": [None, 8]}).for_model(QWEN)
+    cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)
+    assert len(cands) == sp.size() // 16  # ranked at sglang's defaults: the roofline does not model them
+    best = cands[0].cfg
+    assert best["enable_mixed_chunk"] is False and best["prefill_decode_interval"] is None
+    assert "prefill_delayer_queue_min_ratio" not in best  # unlisted opt-in knob stays absent
+    swept = {(k, v[k]) for v in S.unmodelled_variants(best, sp) for k in S.OPT_IN_SPACE if k in best and v[k] != best[k]}
+    assert swept == {("enable_mixed_chunk", True), ("prefill_decode_interval", 8)}
 
 
 def test_successive_halving_with_fake_measure():
     sp = _small_space()
-    cands = S.prefilter(sp, wl, slo, hw, ModelSpec(), calib.params)
+    cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)
     calls = []
 
     def measure(cfg, round_name, repeat):
@@ -109,15 +143,15 @@ def test_successive_halving_with_fake_measure():
 
 def test_successive_halving_all_failures_has_no_winner():
     sp = _small_space()
-    cands = S.prefilter(sp, wl, slo, hw, ModelSpec(), calib.params)
+    cands = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)
     res = S.successive_halving(cands, SLO_, sp, lambda c, r, i: {"ok": False, "error": "x"}, k=4)
     assert res.winner is None and not res.slo_met
 
 
 def test_ladder_is_sorted_and_varies_only_online_knobs():
     sp = _small_space()
-    base = S.prefilter(sp, wl, slo, hw, ModelSpec(), calib.params)[0].cfg
-    ladder = S.build_ladder(base, wl, slo, hw, ModelSpec(), calib.params, sp, {})
+    base = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)[0].cfg
+    ladder = S.build_ladder(base, wl, slo, hw, QWEN, calib.params, sp, {})
     assert ladder
     ttfts = [r["ttft_p90_ms"] for r in ladder]
     thr = [r["tok_s_slow"] for r in ladder]  # per-user speed: the throughput-priority axis
@@ -127,3 +161,18 @@ def test_ladder_is_sorted_and_varies_only_online_knobs():
         assert set(r["online"]) == {"chunked_prefill_size", "max_running_requests"}
         assert r["online"]["chunked_prefill_size"] <= base["chunked_prefill_size"]
         assert r["online"]["max_running_requests"] <= base["max_running_requests"]
+
+
+def test_srpt_base_ladder_tightens_srpt_below_rung_0_and_never_homes_there():
+    sp = _small_space()
+    base = S.prefilter(sp, wl, slo, hw, QWEN, calib.params)[0].cfg
+    plain = S.build_ladder(base, wl, slo, hw, QWEN, calib.params, sp, {}, objective="balanced")
+    ladder = S.build_ladder({**base, "schedule_policy": "green-srpt"}, wl, slo, hw, QWEN, calib.params, sp, {}, objective="balanced")
+    n = len(ladder) - len(plain)
+    assert n == S.SRPT_TIGHTEN_STEPS and [r["rung"] for r in ladder] == list(range(len(ladder)))
+    levels = [(r["online"]["srpt_age"], r["online"]["srpt_min_share"]) for r in ladder]
+    assert levels[:n + 1] == S.srpt_levels()[::-1]  # tightest first, startup values from the first modelled rung on
+    assert set(levels[n:]) == {S.srpt_levels()[0]}
+    assert all(r["source"] == S.SRPT_SOURCE and r["online"]["chunked_prefill_size"] == plain[0]["online"]["chunked_prefill_size"] for r in ladder[:n])
+    assert [{k: r["online"][k] for k in ("chunked_prefill_size", "max_running_requests")} for r in ladder[n:]] == [r["online"] for r in plain]
+    assert {o: h - n for o, h in S.ladder_homes(ladder, slo).items()} == S.ladder_homes(plain, slo)
